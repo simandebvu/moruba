@@ -34,6 +34,7 @@ import {
 } from '../engine/moruba.js';
 import { searchLevel, type Level } from '../engine/search.js';
 import { BoardView } from './board-view.js';
+import { GhostHand } from './ghost-hand.js';
 import { pinchPoint } from './hands.js';
 import { LESSON, LESSON_BONUS, LESSON_END, lessonState } from './lesson.js';
 import {
@@ -124,6 +125,11 @@ export class GameSystem extends createSystem({
   private mover: Player = HUMAN;
 
   private view!: BoardView;
+  /** The opponent's hand, sowing its moves. */
+  private ghost: GhostHand | null = null;
+  /** Captured seeds waiting their turn to fly to the tray, and when each lands. */
+  private flights: { at: number; id: number; target: Vec3 }[] = [];
+  private landings: number[] = [];
   private viewEntity!: Entity;
   private entities: Entity[] = [];
 
@@ -296,6 +302,12 @@ export class GameSystem extends createSystem({
       entity.addComponent(RayInteractable);
       this.entities.push(entity);
     }
+    this.ghost?.dispose();
+    this.ghost = new GhostHand();
+    this.ghost.setRest(0, TOP_Y + 0.16, -(this.view.handleZ + 0.16));
+    this.entities.push(
+      this.world.createTransformEntity(this.ghost.group, this.viewEntity),
+    );
     const pits = loopSize(this.options);
     this.centres = new Float32Array(pits * 4);
     for (const player of [0, 1] as const) {
@@ -415,7 +427,7 @@ export class GameSystem extends createSystem({
       this.lessonBody = LESSON_END.body;
       this.readSince = this.clock;
     }
-    this.sounds.lift();
+    this.sounds.step();
   }
 
   private finishLesson(): void {
@@ -492,6 +504,9 @@ export class GameSystem extends createSystem({
     const n = loopSize(this.options);
     let id = 0;
     this.hand = [];
+    this.flights = [];
+    this.landings = [];
+    this.ghost?.hide();
     this.movingCount = 0;
     this.moving.fill(0);
     for (const player of [0, 1] as const) {
@@ -598,16 +613,25 @@ export class GameSystem extends createSystem({
 
   // ---------------------------------------------------- seed choreography
 
+  /** The opponent's hand hovers over one of the pits (any side of the board). */
+  private ghostOver(owner: Player, pit: number): void {
+    const pits = this.centres.length / 4;
+    const i = (owner * pits + pit) * 2;
+    this.ghost?.moveTo(this.centres[i], TOP_Y + CARRY_HEIGHT, this.centres[i + 1]);
+  }
+
   private liftPit(player: Player, pit: number): void {
+    if (player === AI) this.ghostOver(AI, pit);
     const ids = this.pitSeeds[player][pit].splice(0);
     this.hand.push(...ids);
     this.hand.forEach((id, k) =>
       this.moveSeed(id, this.carrySlot(player, pit, k), 0.18, 0.004),
     );
-    this.sounds.lift();
+    this.sounds.lift(ids.length);
   }
 
   private dropInto(player: Player, pit: number): void {
+    if (player === AI) this.ghostOver(AI, pit);
     const id = this.hand.pop();
     if (id === undefined) return;
     const list = this.pitSeeds[player][pit];
@@ -619,14 +643,43 @@ export class GameSystem extends createSystem({
     this.sounds.clack(list.length);
   }
 
+  /**
+   * A capture: a knock and a ring bursting from the pit, the seeds jump, then
+   * leave one after another in a high arc and rattle into the captor's tray.
+   */
   private capturePit(by: Player, pit: number): void {
-    const ids = this.pitSeeds[other(by)][pit].splice(0);
+    const victim = other(by);
+    if (by === AI) this.ghostOver(victim, pit);
+    const ids = this.pitSeeds[victim][pit].splice(0);
     ids.forEach((id, k) => {
       const slot = this.store[by].length;
       this.store[by].push(id);
-      this.moveSeed(id, storeSlot(this.options, by, slot), 0.5 + k * 0.03, 0.07);
+      // A startled hop in place first.
+      const i = id * 3;
+      this.moveSeed(id, [this.pos[i], this.pos[i + 1] + 0.012, this.pos[i + 2]], 0.16, 0.012);
+      // One steady stream, even when two pits are taken at once.
+      const last = this.flights[this.flights.length - 1];
+      this.flights.push({
+        at: Math.max(this.clock + 0.2, last ? last.at + 0.07 : 0),
+        id,
+        target: storeSlot(this.options, by, slot),
+      });
     });
+    this.view.flash(victim, pit, by === HUMAN ? GOLD : RED);
     this.sounds.capture();
+  }
+
+  /** Send off captured seeds whose moment has come, and sound each landing. */
+  private updateFlights(): void {
+    while (this.flights.length > 0 && this.flights[0].at <= this.clock) {
+      const flight = this.flights.shift()!;
+      this.moveSeed(flight.id, flight.target, 0.6, 0.13);
+      this.landings.push(this.clock + 0.58);
+    }
+    while (this.landings.length > 0 && this.landings[0] <= this.clock) {
+      this.landings.shift();
+      this.sounds.trayHit();
+    }
   }
 
   /** Queue the animation for a sow. `skipFirstLift`: the human already lifted the pit. */
@@ -740,6 +793,7 @@ export class GameSystem extends createSystem({
   }
 
   private nextTurn(): void {
+    this.ghost?.hide();
     if (this.lesson >= 0) {
       this.lessonRead();
       return;
@@ -800,6 +854,7 @@ export class GameSystem extends createSystem({
     this.pendingBonus = [...move.bonus];
     this.queue(0.05, () => {
       this.scriptHighlight = { player: AI, pit: move.pit, colour: GOLD };
+      this.ghostOver(AI, move.pit);
     });
     this.queue(0.6, () => {
       this.scriptHighlight = null;
@@ -879,7 +934,7 @@ export class GameSystem extends createSystem({
       this.moveSeed(id, this.slotIn(HUMAN, pit, list.length - 1), 0.15, 0.003);
     }
     this.phase = 'human';
-    this.sounds.lift();
+    this.sounds.step();
   }
 
   /** The pit or button at a world point, as a code (see `directHover`). */
@@ -953,7 +1008,7 @@ export class GameSystem extends createSystem({
         if (code === HANDLE) {
           if (tracked && this.phase !== 'held' && this.placement.beginDrag(this.pinch)) {
             this.dragSide = side;
-            this.sounds.lift();
+            this.sounds.step();
           }
         } else if (code >= 1000) {
           this.onButton(this.view.buttons[code - 1000].action);
@@ -1173,7 +1228,7 @@ export class GameSystem extends createSystem({
         this.placement.startPlacing();
         break;
     }
-    this.sounds.lift();
+    this.sounds.step();
   }
 
   // --------------------------------------------------------------- frame
@@ -1200,10 +1255,14 @@ export class GameSystem extends createSystem({
     while (this.steps.length > 0 && this.steps[0].at <= this.clock) {
       this.steps.shift()!.run();
     }
+    this.updateFlights();
     this.updateSeeds();
+    this.view.update(delta);
+    this.ghost?.update(delta * speed);
     if (
       this.phase === 'animating' &&
       this.steps.length === 0 &&
+      this.flights.length === 0 &&
       this.movingCount === 0
     ) {
       const done = this.onScriptEnd;
@@ -1224,6 +1283,8 @@ export class GameSystem extends createSystem({
       this.updateDirect(delta);
     } else {
       this.directHover = -1;
+      // The handle is for hands only.
+      this.view.setHandle('hidden');
       if (this.dragSide) {
         // Hands lost while carrying the board: set it down where it is.
         this.dragSide = null;

@@ -129,6 +129,9 @@ export class BoardView {
   private highlight: Mesh;
   /** Extra rings for the move preview: where it ends, what it captures. */
   private marks: Mesh[] = [];
+  /** Expanding rings that mark a capture, with each one's age in seconds (-1 = idle). */
+  private flashes: Mesh[] = [];
+  private flashAge: number[] = [];
   private label: TextPlane;
   private hud: TextPlane;
   private lesson: TextPlane;
@@ -384,6 +387,17 @@ export class BoardView {
       this.marks.push(mark);
       this.disposables.push(material);
     }
+    for (let i = 0; i < 3; i++) {
+      const material = ringMaterial.clone();
+      material.depthWrite = false;
+      const flash = new Mesh(ringGeometry, material);
+      flash.name = `pit-flash-${i}`;
+      flash.visible = false;
+      this.root.add(flash);
+      this.flashes.push(flash);
+      this.flashAge.push(-1);
+      this.disposables.push(material);
+    }
 
     this.label = new TextPlane(0.034, 0.034, 4000, (ctx, w, h, text) => {
       ctx.fillStyle = 'rgba(24, 16, 10, 0.9)';
@@ -556,6 +570,35 @@ export class BoardView {
     this.highlight.visible = false;
   }
 
+  /** A ring bursting outwards from a pit: something was captured there. */
+  flash(player: Player, pit: number, colour: number): void {
+    let slot = this.flashAge.indexOf(-1);
+    if (slot < 0) slot = 0;
+    const [x, , z] = pitCentre(this.options, player, pit);
+    const mesh = this.flashes[slot];
+    mesh.position.set(x, TOP_Y + 0.002, z);
+    (mesh.material as MeshBasicMaterial).color.setHex(colour);
+    this.flashAge[slot] = 0;
+  }
+
+  /** Advance the capture flashes. */
+  update(delta: number): void {
+    for (let i = 0; i < this.flashes.length; i++) {
+      if (this.flashAge[i] < 0) continue;
+      this.flashAge[i] += delta;
+      const t = this.flashAge[i] / 0.55;
+      const mesh = this.flashes[i];
+      if (t >= 1) {
+        this.flashAge[i] = -1;
+        mesh.visible = false;
+        continue;
+      }
+      mesh.visible = true;
+      mesh.scale.setScalar(1 + t * 1.9);
+      (mesh.material as MeshBasicMaterial).opacity = 0.95 * (1 - t) * (1 - t);
+    }
+  }
+
   /** Ring up to three more pits (the move preview). Call with nothing to clear. */
   showMarks(marks: readonly { player: Player; pit: number; colour: number }[] = []): void {
     this.marks.forEach((mesh, i) => {
@@ -586,7 +629,8 @@ export class BoardView {
   }
 
   /** The handle swells while a hand is on it and says what letting go does. */
-  setHandle(state: 'idle' | 'near' | 'held'): void {
+  setHandle(state: 'hidden' | 'idle' | 'near' | 'held'): void {
+    this.handle.mesh.visible = state !== 'hidden';
     this.handle.mesh.scale.setScalar(state === 'idle' ? 1 : 1.15);
     this.handle.set(state === 'held' ? 'Let go to set it down' : 'Pinch and hold to move');
   }
