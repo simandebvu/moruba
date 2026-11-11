@@ -3,7 +3,10 @@ import projectOptions from 'virtual:iwsdk-project';
 import { GameSystem } from './game/game-system.js';
 import { PlacementSystem } from './game/placement.js';
 import { PanelSystem } from './panel.js';
+import { installErrorReporting } from './report.js';
 import { SpikeSystem } from './spike.js';
+
+installErrorReporting();
 
 World.create(
   document.getElementById('scene-container') as HTMLDivElement,

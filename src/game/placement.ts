@@ -29,6 +29,7 @@ import {
   XRPlane,
   type Entity,
 } from '@iwsdk/core';
+import { describeSession, report } from '../report.js';
 
 const POSE_KEY = 'moruba_board_pose';
 const ANCHOR_UUID_KEY = 'iwsdk_scene_anchor_uuid';
@@ -92,6 +93,9 @@ export class PlacementSystem extends createSystem({
     right: undefined,
   };
   private uuidPoll = 0;
+  /** Dev only: seconds until the next status note to the Mac, and how many are left. */
+  private reportIn = 0;
+  private reportsLeft = 0;
   private reticles!: Record<'left' | 'right', Entity>;
 
   private headPos = new Vector3();
@@ -188,6 +192,8 @@ export class PlacementSystem extends createSystem({
 
   private enterXR(): void {
     this.setMode('settling');
+    this.reportIn = 0;
+    this.reportsLeft = 8;
     this.virtualApplied = false;
     this.root.visible = false;
     this.pendingRestore = null;
@@ -298,12 +304,39 @@ export class PlacementSystem extends createSystem({
     this.awaitingUuid = pose.anchorUuid === null;
   }
 
+  /** Dev only: a few notes on where the head and the board are, sent to the Mac. */
+  private reportStatus(delta: number): void {
+    if (this.reportsLeft <= 0) return;
+    this.reportIn -= delta;
+    if (this.reportIn > 0) return;
+    this.reportIn = 2.5;
+    this.reportsLeft -= 1;
+    const round = (v: Vector3) => [v.x, v.y, v.z].map((n) => Math.round(n * 100) / 100);
+    this.player.head.getWorldPosition(this.headPos);
+    this.root.getWorldPosition(this.tmp);
+    let planes = 0;
+    for (const _ of this.queries.planes.entities) planes += 1;
+    report('game-status', {
+      mode: this.mode,
+      note: this.note,
+      head: round(this.headPos),
+      board: round(this.tmp),
+      boardVisible: this.root.visible,
+      virtual: this.virtual,
+      anchorAttached: this.anchorAttached,
+      savedPose: readStorage(POSE_KEY) !== null,
+      planes,
+      session: describeSession(this.xrManager.getSession()),
+    });
+  }
+
   update(delta: number): void {
     if (this.mode === 'browser') return;
     this.modeTime += delta;
     if (this.cooldown > 0) this.cooldown -= delta;
 
     this.refreshRays();
+    this.reportStatus(delta);
 
     if (this.mode === 'settling') {
       // Give tracking, planes and the anchor a moment; do not wait for ever.

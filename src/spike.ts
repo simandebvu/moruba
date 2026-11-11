@@ -1,10 +1,12 @@
 /**
- * Day-1 device check ("spike"). Proves the platform pieces Moruba depends on:
- * hands, plane/mesh detection, hit-test placement by pinch, and a persistent
- * anchor that brings the placed object back after a reload.
+ * Device check at `/?check`. Proves the platform pieces Moruba depends on:
+ * hands, pinch, table detection, hit-test placement, a persistent anchor that
+ * brings the placed object back after a reload, and frame rate.
  *
- * A status board floats in front of the player and reports each check live.
- * This file is throwaway: the real board placement replaces it on day 2.
+ * It is a guided walk-through: one instruction at a time on a panel in front
+ * of the player, each step passing by itself (with a chime) or timing out, so
+ * nothing has to be read off a screen outside the headset. Every result is
+ * also sent to the dev server (src/report.ts).
  */
 
 import {
@@ -28,6 +30,8 @@ import {
   XRPlane,
   type Entity,
 } from '@iwsdk/core';
+import { Sounds } from './game/sounds.js';
+import { describeSession, report, reportDelivered } from './report.js';
 
 const POSE_KEY = 'moruba_spike_pose';
 const ANCHOR_UUID_KEY = 'iwsdk_scene_anchor_uuid';
@@ -57,6 +61,103 @@ function writeStorage(key: string, value: string): boolean {
   }
 }
 
+type StepId =
+  | 'restore'
+  | 'hands'
+  | 'pinch'
+  | 'table'
+  | 'point'
+  | 'place'
+  | 'save'
+  | 'fps'
+  | 'done';
+
+type Grade = 'pass' | 'part' | 'fail';
+
+interface Result {
+  id: StepId;
+  label: string;
+  grade: Grade;
+  detail: string;
+}
+
+interface StepText {
+  /** Short name used in the summary. */
+  label: string;
+  headline: string;
+  body: string;
+  /** Seconds before the step gives up and moves on. */
+  limit: number;
+}
+
+const STEP_TEXT: Record<StepId, StepText> = {
+  restore: {
+    label: 'Cube came back',
+    headline: 'Welcome back',
+    body: 'Look at where you put the cube. I am checking that it returns to the same spot.',
+    limit: 12,
+  },
+  hands: {
+    label: 'Hands',
+    headline: 'Hold up both hands',
+    body: 'Put the controllers down, out of sight. Hold both open hands in front of you.',
+    limit: 25,
+  },
+  pinch: {
+    label: 'Pinch',
+    headline: 'Pinch with each hand',
+    body: 'Touch thumb and first finger together, once with the left hand and once with the right.',
+    limit: 25,
+  },
+  table: {
+    label: 'Table found',
+    headline: 'Look down at your table',
+    body: 'I am looking for the table you marked in Space Setup.',
+    limit: 12,
+  },
+  point: {
+    label: 'Pointing at a surface',
+    headline: 'Point at the table top',
+    body: 'Reach a hand out and point at the table. A yellow ring should land on it.',
+    limit: 30,
+  },
+  place: {
+    label: 'Cube placed',
+    headline: 'Pinch to drop a cube',
+    body: 'Keep the yellow ring on the table and pinch. An orange cube appears there.',
+    limit: 30,
+  },
+  save: {
+    label: 'Spot remembered',
+    headline: 'Remembering the spot',
+    body: 'Hold on a moment while the headset saves where the cube is.',
+    limit: 12,
+  },
+  fps: {
+    label: 'Smoothness',
+    headline: 'Look around slowly',
+    body: 'Measuring how smoothly this runs.',
+    limit: 6,
+  },
+  done: { label: '', headline: '', body: '', limit: Infinity },
+};
+
+function wrap(ctx: CanvasRenderingContext2D, text: string, width: number): string[] {
+  const lines: string[] = [];
+  let line = '';
+  for (const word of text.split(' ')) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(next).width > width) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 export class SpikeSystem extends createSystem({
   planes: { required: [XRPlane] },
   meshes: { required: [XRMesh] },
@@ -77,12 +178,29 @@ export class SpikeSystem extends createSystem({
   private texture!: CanvasTexture;
   private lastText = '';
   private sinceDraw = 0;
+  private boardSnapped = false;
+  private sounds = new Sounds();
 
   private frames = 0;
   private fpsTime = 0;
   private fps = 0;
-  private placements = 0;
-  private pinches = 0;
+
+  // The guided run.
+  private steps: StepId[] = [];
+  private stepIndex = 0;
+  private stepTime = 0;
+  /** Seconds left showing the result of the step that just finished. */
+  private pause = 0;
+  private results: Result[] = [];
+  private handSeen = { left: false, right: false };
+  private pinchSeen = { left: false, right: false };
+  private hitTime = 0;
+  private hitSeen = false;
+  private autoPlaced = false;
+  private sampleFrames = 0;
+  private sampleTime = 0;
+  private didRestore = false;
+  private snapshot = { planes: 0, tablePlanes: 0, meshes: 0, tableMeshes: 0 };
 
   private headPos = new Vector3();
   private headDir = new Vector3();
@@ -114,12 +232,12 @@ export class SpikeSystem extends createSystem({
     this.cube = this.world.createTransformEntity(cubeMesh);
 
     this.canvas = document.createElement('canvas');
-    this.canvas.width = 768;
-    this.canvas.height = 512;
+    this.canvas.width = 1024;
+    this.canvas.height = 800;
     this.texture = new CanvasTexture(this.canvas);
     this.texture.colorSpace = SRGBColorSpace;
     this.board = new Mesh(
-      new PlaneGeometry(0.36, 0.24),
+      new PlaneGeometry(0.62, 0.484),
       new MeshBasicMaterial({ map: this.texture, transparent: true }),
     );
     this.board.name = 'status-board';
@@ -131,7 +249,9 @@ export class SpikeSystem extends createSystem({
         const inXR = state !== VisibilityState.NonImmersive;
         this.board.visible = inXR;
         if (inXR) {
+          this.sounds.unlock();
           this.beginRestore();
+          this.beginRun();
         } else {
           // The anchor group is torn down with the session; start clean.
           this.pendingRestore = null;
@@ -144,6 +264,95 @@ export class SpikeSystem extends createSystem({
         }
       }),
     );
+    const unlock = () => this.sounds.unlock();
+    window.addEventListener('pointerdown', unlock);
+    this.cleanupFuncs.push(() => window.removeEventListener('pointerdown', unlock));
+  }
+
+  private beginRun(): void {
+    this.didRestore = this.pendingRestore !== null;
+    this.steps = [
+      ...(this.didRestore ? (['restore'] as StepId[]) : []),
+      'hands',
+      'pinch',
+      'table',
+      'point',
+      'place',
+      'save',
+      'fps',
+      'done',
+    ];
+    this.stepIndex = 0;
+    this.stepTime = 0;
+    this.pause = 0;
+    this.results = [];
+    this.handSeen = { left: false, right: false };
+    this.pinchSeen = { left: false, right: false };
+    this.hitTime = 0;
+    this.hitSeen = false;
+    this.autoPlaced = false;
+    this.boardSnapped = false;
+    this.lastText = '';
+    report('check-start', {
+      steps: this.steps,
+      session: describeSession(this.xrManager.getSession()),
+    });
+  }
+
+  private get step(): StepId {
+    return this.steps[this.stepIndex] ?? 'done';
+  }
+
+  /** Record how the current step went, show it briefly, then move on. */
+  private finish(grade: Grade, detail: string): void {
+    const id = this.step;
+    const result: Result = { id, label: STEP_TEXT[id].label, grade, detail };
+    this.results.push(result);
+    this.pause = 1.6;
+    if (grade === 'fail') this.sounds.deny();
+    else this.sounds.capture();
+    report('check-step', {
+      ...result,
+      seconds: Math.round(this.stepTime * 10) / 10,
+      anchorNote: this.anchorNote,
+      ...this.snapshot,
+      session: describeSession(this.xrManager.getSession()),
+    });
+  }
+
+  private advance(): void {
+    this.stepIndex += 1;
+    this.stepTime = 0;
+    if (this.step === 'fps') {
+      this.sampleFrames = 0;
+      this.sampleTime = 0;
+    }
+    if (this.step === 'done') {
+      report('check-done', {
+        results: this.results,
+        fps: this.fps,
+        anchorNote: this.anchorNote,
+        planeList: this.describePlanes(),
+        ...this.snapshot,
+        session: describeSession(this.xrManager.getSession()),
+      });
+    }
+  }
+
+  private describePlanes(): unknown[] {
+    const list: unknown[] = [];
+    for (const entity of this.queries.planes.entities) {
+      const plane = entity.getValue(XRPlane, '_plane') as
+        | { orientation?: string; semanticLabel?: string }
+        | undefined;
+      const y = entity.object3D ? entity.object3D.getWorldPosition(this.tmp).y : null;
+      list.push({
+        orientation: plane?.orientation ?? null,
+        label: plane?.semanticLabel ?? null,
+        y: y === null ? null : Math.round(y * 100) / 100,
+      });
+    }
+    return list;
   }
 
   /**
@@ -213,11 +422,10 @@ export class SpikeSystem extends createSystem({
         : 'saved (no persistent id yet)';
   }
 
-  private placeCube(reticle: Entity): void {
-    const from = reticle.object3D;
+  /** Put the cube at the world position held in `this.tmp`. */
+  private placeCube(): void {
     const object = this.cube.object3D;
-    if (!from || !object) return;
-    from.getWorldPosition(this.tmp);
+    if (!object) return;
     // Keep the cube upright and turned to face the player.
     this.player.head.getWorldPosition(this.headPos);
     const yaw = Math.atan2(this.headPos.x - this.tmp.x, this.headPos.z - this.tmp.z);
@@ -238,7 +446,6 @@ export class SpikeSystem extends createSystem({
     object.visible = true;
     this.cubePlaced = true;
     this.pendingRestore = null;
-    this.placements += 1;
     this.anchorNote = 'placing…';
   }
 
@@ -255,13 +462,8 @@ export class SpikeSystem extends createSystem({
     }
 
     this.refreshRays();
-    const xr = this.input.xr;
-    for (const side of ['left', 'right'] as const) {
-      const select = xr.getSelectState(side);
-      if (!select.start) continue;
-      this.pinches += 1;
-      if (this.hasHit(side)) this.placeCube(this.reticles[side]);
-    }
+    this.countSurfaces();
+    this.runStep(delta);
 
     const attached =
       this.cube.hasComponent(XRAnchor) &&
@@ -293,35 +495,14 @@ export class SpikeSystem extends createSystem({
     this.updateBoard(delta);
   }
 
-  private updateBoard(delta: number): void {
-    // Float the board ahead of the player, slightly below eye level.
-    const head = this.player.head;
-    head.getWorldPosition(this.headPos);
-    head.getWorldDirection(this.headDir);
-    this.headDir.y = 0;
-    if (this.headDir.lengthSq() < 1e-6) this.headDir.set(0, 0, -1);
-    this.headDir.normalize();
-    // Object3D.getWorldDirection points along +Z; the head looks along -Z.
-    // Off to one side so it never covers the table in front of the player.
-    this.target
-      .copy(this.headPos)
-      .addScaledVector(this.headDir, -0.7)
-      .addScaledVector(this.tmp.set(this.headDir.z, 0, -this.headDir.x), 0.32)
-      .setY(this.headPos.y - 0.1);
-    this.board.position.lerp(this.target, Math.min(1, delta * 2));
-    this.board.lookAt(this.headPos);
-
-    this.sinceDraw += delta;
-    if (this.sinceDraw < 0.25) return;
-    this.sinceDraw = 0;
-
-    const xr = this.input.xr;
-    const handL = xr.isPrimary('hand', 'left');
-    const handR = xr.isPrimary('hand', 'right');
-    let tablePlanes = 0;
-    let planeCount = 0;
+  private countSurfaces(): void {
+    const snap = this.snapshot;
+    snap.planes = 0;
+    snap.tablePlanes = 0;
+    snap.meshes = 0;
+    snap.tableMeshes = 0;
     for (const entity of this.queries.planes.entities) {
-      planeCount += 1;
+      snap.planes += 1;
       const plane = entity.getValue(XRPlane, '_plane') as
         | { orientation?: string }
         | undefined;
@@ -331,48 +512,293 @@ export class SpikeSystem extends createSystem({
         y >= TABLE_MIN_Y &&
         y <= TABLE_MAX_Y
       ) {
-        tablePlanes += 1;
+        snap.tablePlanes += 1;
       }
     }
-    let meshCount = 0;
-    let tableMeshes = 0;
     for (const entity of this.queries.meshes.entities) {
-      meshCount += 1;
-      if (entity.getValue(XRMesh, 'semanticLabel') === 'table') tableMeshes += 1;
+      snap.meshes += 1;
+      if (entity.getValue(XRMesh, 'semanticLabel') === 'table') snap.tableMeshes += 1;
     }
+  }
+
+  private runStep(delta: number): void {
+    if (this.pause > 0) {
+      this.pause -= delta;
+      if (this.pause <= 0) this.advance();
+      return;
+    }
+    const id = this.step;
+    if (id === 'done') return;
+    this.stepTime += delta;
+    const late = this.stepTime >= STEP_TEXT[id].limit;
+    const xr = this.input.xr;
     const hitL = this.hasHit('left');
     const hitR = this.hasHit('right');
 
-    const mark = (ok: boolean) => (ok ? '✔' : '·');
+    switch (id) {
+      case 'restore': {
+        if (this.anchorNote.startsWith('RESTORED')) {
+          this.finish('pass', 'the cube is back where you left it');
+        } else if (this.anchorNote.startsWith('restored pose')) {
+          this.finish('part', 'the cube is back, but its spot may have shifted');
+        } else if (late) {
+          this.finish('fail', 'the cube did not come back');
+        }
+        break;
+      }
+      case 'hands': {
+        for (const side of ['left', 'right'] as const) {
+          if (xr.isPrimary('hand', side)) this.handSeen[side] = true;
+        }
+        const { left, right } = this.handSeen;
+        if (left && right) this.finish('pass', 'both hands seen');
+        else if (late && (left || right)) {
+          this.finish('part', `only the ${left ? 'left' : 'right'} hand was seen`);
+        } else if (late) this.finish('fail', 'no hands seen');
+        break;
+      }
+      case 'pinch': {
+        for (const side of ['left', 'right'] as const) {
+          if (xr.getSelectState(side).start) {
+            if (!this.pinchSeen[side]) this.sounds.clack();
+            this.pinchSeen[side] = true;
+          }
+        }
+        const { left, right } = this.pinchSeen;
+        if (left && right) this.finish('pass', 'both hands pinched');
+        else if (late && (left || right)) {
+          this.finish('part', `only the ${left ? 'left' : 'right'} pinch was seen`);
+        } else if (late) this.finish('fail', 'no pinch seen');
+        break;
+      }
+      case 'table': {
+        const snap = this.snapshot;
+        if (snap.tablePlanes + snap.tableMeshes > 0) {
+          this.finish('pass', 'table found');
+        } else if (late) {
+          this.finish(
+            'fail',
+            snap.planes + snap.meshes > 0
+              ? 'surfaces found, but none at table height'
+              : 'the headset reported no surfaces',
+          );
+        }
+        break;
+      }
+      case 'point': {
+        this.hitTime = hitL || hitR ? this.hitTime + delta : 0;
+        if (this.hitTime > 0.6) {
+          this.hitSeen = true;
+          this.finish('pass', 'the ring follows your hand');
+        } else if (late) {
+          this.finish('fail', 'no surface found under your hand');
+        }
+        break;
+      }
+      case 'place': {
+        if (!this.hitSeen) {
+          // Pointing does not work here: still test the anchor, with a cube
+          // set down in front of the player.
+          this.player.head.getWorldPosition(this.headPos);
+          this.player.head.getWorldDirection(this.headDir);
+          this.headDir.y = 0;
+          if (this.headDir.lengthSq() < 1e-6) this.headDir.set(0, 0, 1);
+          this.headDir.normalize();
+          this.tmp
+            .copy(this.headPos)
+            .addScaledVector(this.headDir, -0.5)
+            .setY(this.headPos.y - 0.4);
+          this.placeCube();
+          this.autoPlaced = true;
+          this.finish('part', 'placed for you, in front of you');
+          break;
+        }
+        for (const side of ['right', 'left'] as const) {
+          if (!xr.getSelectState(side).start || !this.hasHit(side)) continue;
+          const from = this.reticles[side].object3D;
+          if (!from) continue;
+          from.getWorldPosition(this.tmp);
+          this.placeCube();
+          this.finish('pass', 'cube placed with a pinch');
+          break;
+        }
+        if (this.pause <= 0 && late) this.finish('fail', 'no pinch on a surface');
+        break;
+      }
+      case 'save': {
+        if (!this.cubePlaced) {
+          this.finish('fail', 'no cube to remember');
+        } else if (
+          this.anchorNote === 'saved (persistent)' ||
+          this.anchorNote.startsWith('RESTORED')
+        ) {
+          this.finish('pass', 'saved for next time');
+        } else if (late) {
+          this.finish(
+            this.anchorNote.startsWith('saved') ? 'part' : 'fail',
+            this.anchorNote.startsWith('saved')
+              ? 'saved for this visit only'
+              : `not saved (${this.anchorNote})`,
+          );
+        }
+        break;
+      }
+      case 'fps': {
+        this.sampleFrames += 1;
+        this.sampleTime += delta;
+        if (late) {
+          const rate = Math.round(this.sampleFrames / this.sampleTime);
+          this.finish(
+            rate >= 68 ? 'pass' : rate >= 55 ? 'part' : 'fail',
+            `${rate} frames a second`,
+          );
+        }
+        break;
+      }
+    }
+  }
+
+  /** The lines for the panel: [kind, text] pairs, drawn top to bottom. */
+  private panelText(): string {
+    const id = this.step;
+    const total = this.steps.length - 1;
+    const mark = (grade: Grade) => (grade === 'pass' ? '✔' : grade === 'part' ? '~' : '✘');
+    if (this.pause > 0) {
+      const last = this.results[this.results.length - 1];
+      return [
+        `small|Step ${this.stepIndex + 1} of ${total}`,
+        `${last.grade}|${mark(last.grade)}  ${last.label}`,
+        `body|${last.detail}`,
+      ].join('\n');
+    }
+    if (id === 'done') {
+      const delivered = reportDelivered();
+      const lines = ['head|All done'];
+      for (const result of this.results) {
+        lines.push(`${result.grade}row|${mark(result.grade)}  ${result.label}: ${result.detail}`);
+      }
+      lines.push(
+        delivered === false
+          ? 'foot|Could not reach the Mac: please read me this list.'
+          : 'foot|Results sent to the Mac.',
+      );
+      lines.push(
+        this.didRestore
+          ? 'foot|You can take the headset off now.'
+          : 'foot|Last thing: reload this page and enter again. I will check the cube comes back.',
+      );
+      return lines.join('\n');
+    }
+    const text = STEP_TEXT[id];
+    const tick = (ok: boolean) => (ok ? '✔' : '…');
+    let live = '';
+    if (id === 'hands') {
+      live = `Left ${tick(this.handSeen.left)}     Right ${tick(this.handSeen.right)}`;
+    } else if (id === 'pinch') {
+      live = `Left ${tick(this.pinchSeen.left)}     Right ${tick(this.pinchSeen.right)}`;
+    } else if (id === 'table') {
+      live = `Surfaces seen: ${this.snapshot.planes + this.snapshot.meshes}`;
+    } else if (id === 'point' || id === 'place') {
+      live = this.hasHit('left') || this.hasHit('right') ? 'Ring is on a surface ✔' : 'No surface yet …';
+    }
+    const left = Math.ceil(text.limit - this.stepTime);
     const lines = [
-      `${mark(handL || handR)} Hands: L ${handL ? 'yes' : 'no'}  R ${handR ? 'yes' : 'no'}`,
-      `${mark(this.pinches > 0)} Pinches seen: ${this.pinches}`,
-      `${mark(tablePlanes + tableMeshes > 0)} Table: ${tablePlanes} plane, ${tableMeshes} mesh  (all: ${planeCount}/${meshCount})`,
-      `${mark(hitL || hitR)} Surface under ray: L ${hitL ? 'yes' : 'no'}  R ${hitR ? 'yes' : 'no'}`,
-      `${mark(this.cubePlaced)} Cube placed: ${this.placements}`,
-      `${mark(this.anchorNote.startsWith('RESTORED') || this.anchorNote.startsWith('saved (persistent'))} Anchor: ${this.anchorNote}`,
-      `${mark(this.fps >= 70)} ${this.fps} fps`,
+      `small|Step ${this.stepIndex + 1} of ${total}`,
+      `head|${text.headline}`,
+      `body|${text.body}`,
     ];
-    const text = lines.join('\n');
+    if (live) lines.push(`live|${live}`);
+    if (id !== 'fps' && left <= 8) lines.push(`foot|Moving on in ${left}…`);
+    return lines.join('\n');
+  }
+
+  private updateBoard(delta: number): void {
+    // Keep the panel straight ahead at about eye level, so it stays above the
+    // table when the player looks down.
+    const head = this.player.head;
+    head.getWorldPosition(this.headPos);
+    head.getWorldDirection(this.headDir);
+    this.headDir.y = 0;
+    if (this.headDir.lengthSq() < 1e-6) this.headDir.set(0, 0, 1);
+    this.headDir.normalize();
+    // Object3D.getWorldDirection points along +Z; the head looks along -Z.
+    this.target
+      .copy(this.headPos)
+      .addScaledVector(this.headDir, -0.95)
+      .setY(this.headPos.y - 0.04);
+    if (this.boardSnapped) {
+      this.board.position.lerp(this.target, Math.min(1, delta * 1.5));
+    } else if (this.headPos.lengthSq() > 1e-6) {
+      this.board.position.copy(this.target);
+      this.boardSnapped = true;
+    }
+    this.board.lookAt(this.headPos);
+
+    this.sinceDraw += delta;
+    if (this.sinceDraw < 0.2) return;
+    this.sinceDraw = 0;
+
+    const text = this.panelText();
     if (text === this.lastText) return;
     this.lastText = text;
     (globalThis as { __morubaSpike?: string }).__morubaSpike = text;
 
     const ctx = this.canvas.getContext('2d');
     if (!ctx) return;
-    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    ctx.fillStyle = 'rgba(20, 14, 10, 0.88)';
+    const { width, height } = this.canvas;
+    const pad = 56;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#1a120c';
     ctx.beginPath();
-    ctx.roundRect(0, 0, this.canvas.width, this.canvas.height, 36);
+    ctx.roundRect(0, 0, width, height, 44);
     ctx.fill();
-    ctx.fillStyle = '#ffd23a';
-    ctx.font = 'bold 40px system-ui, sans-serif';
-    ctx.fillText('Moruba device check', 36, 62);
-    ctx.font = '32px system-ui, sans-serif';
-    lines.forEach((line, i) => {
-      ctx.fillStyle = line.startsWith('✔') ? '#9be28a' : '#f3ead9';
-      ctx.fillText(line, 36, 128 + i * 54, this.canvas.width - 72);
-    });
+
+    const colours: Record<string, string> = {
+      pass: '#9be28a',
+      part: '#ffd23a',
+      fail: '#ff8f7a',
+    };
+    let y = 40;
+    for (const entry of text.split('\n')) {
+      const cut = entry.indexOf('|');
+      const kind = entry.slice(0, cut);
+      const content = entry.slice(cut + 1);
+      let size = 40;
+      let colour = '#f3ead9';
+      let weight = '';
+      if (kind === 'small') {
+        size = 40;
+        colour = '#c9b89c';
+      } else if (kind === 'head') {
+        size = 88;
+        colour = '#ffd23a';
+        weight = 'bold ';
+      } else if (kind === 'pass' || kind === 'part' || kind === 'fail') {
+        size = 84;
+        colour = colours[kind];
+        weight = 'bold ';
+      } else if (kind.endsWith('row')) {
+        size = 34;
+        colour = colours[kind.slice(0, -3)];
+      } else if (kind === 'live') {
+        size = 64;
+        colour = '#9be28a';
+        weight = 'bold ';
+      } else if (kind === 'foot') {
+        size = 40;
+        colour = '#c9b89c';
+      } else {
+        size = 54;
+      }
+      ctx.font = `${weight}${size}px system-ui, sans-serif`;
+      ctx.fillStyle = colour;
+      if (kind === 'foot' || kind === 'live') y += 12;
+      for (const line of wrap(ctx, content, width - pad * 2)) {
+        y += size * 1.22;
+        ctx.fillText(line, pad, y);
+      }
+      y += kind === 'head' || kind === 'small' ? 10 : 4;
+    }
     this.texture.needsUpdate = true;
   }
 }
