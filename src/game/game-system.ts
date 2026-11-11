@@ -712,6 +712,7 @@ export class GameSystem extends createSystem({
 
   private applyBonus(player: Player, pit: number): void {
     const next = takeBonus(this.state, pit);
+    report('bonus', { player, pit });
     const victim = other(player);
     this.queue(0.15, () => {
       this.scriptHighlight = { player: victim, pit, colour: RED };
@@ -734,6 +735,7 @@ export class GameSystem extends createSystem({
     }
     if (outcome(this.state).over) {
       this.phase = 'over';
+      report('game-over', { outcome: outcome(this.state), pits: this.state.pits, moves: this.state.moveCount });
       this.sounds.gameOver();
       if (this.teach) {
         this.tip = 'A player with no move left loses. That was your first game: Teach me turns off for the next one.';
@@ -881,10 +883,10 @@ export class GameSystem extends createSystem({
     }
     this.view.root.worldToLocal(this.local.copy(point));
     if (
-      Math.abs(this.local.x) < 0.095 &&
-      Math.abs(this.local.z - this.view.handleZ) < 0.03 &&
-      this.local.y > -0.035 &&
-      this.local.y < 0.075
+      Math.abs(this.local.x) < 0.09 &&
+      Math.abs(this.local.z - this.view.handleZ) < 0.022 &&
+      this.local.y > -0.03 &&
+      this.local.y < 0.06
     ) {
       return HANDLE;
     }
@@ -929,7 +931,9 @@ export class GameSystem extends createSystem({
         continue;
       }
       if (select.start && !this.placement.busy) {
-        const code = before >= 0 ? before : now;
+        // The handle only counts if the hand is still on it: a hand passing
+        // over it on the way to a pit means the pit.
+        const code = before >= 0 && !(before === HANDLE && now !== HANDLE) ? before : now;
         if (code === HANDLE) {
           if (tracked && this.phase !== 'held' && this.placement.beginDrag(this.pinch)) {
             this.dragSide = side;

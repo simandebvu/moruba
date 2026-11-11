@@ -476,7 +476,8 @@ export class BoardView {
     this.texts.push(this.hud);
 
     // Grab handle on the player's side: pinch and hold it to carry the board.
-    this.handleZ = depth / 2 + 0.03;
+    // Well clear of the nearest pits, so reaching for them never grabs it.
+    this.handleZ = depth / 2 + 0.06;
     this.handle = new TextPlane(0.17, 0.026, 2600, (ctx, w, h, label) => {
       panel(ctx, w, h, 'rgba(232, 201, 138, 0.96)');
       ctx.fillStyle = '#3a2410';
