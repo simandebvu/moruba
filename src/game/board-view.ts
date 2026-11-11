@@ -375,7 +375,7 @@ export class BoardView {
     this.highlight.visible = false;
     this.root.add(this.highlight);
     this.disposables.push(ringGeometry, ringMaterial);
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       const material = ringMaterial.clone();
       const mark = new Mesh(ringGeometry, material);
       mark.name = `pit-mark-${i}`;

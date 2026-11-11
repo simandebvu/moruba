@@ -23,7 +23,7 @@ export interface LessonStage {
 export const LESSON: LessonStage[] = [
   {
     title: 'Sowing',
-    ask: 'The two rows nearest you are yours. Pinch the glowing pit to scoop its seeds, then let go.',
+    ask: 'The two rows nearest you are yours. Pinch the glowing pit to pick up its seeds, carry them over the next pits, then let go.',
     after:
       'Seeds drop one per pit, anticlockwise round your two rows. The last one fell in an empty pit, so the move ended.',
     pit: 1,

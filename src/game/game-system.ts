@@ -29,6 +29,7 @@ import {
   type Options,
   type Player,
   type SowEvent,
+  type SowResult,
   type State,
 } from '../engine/moruba.js';
 import { searchLevel, type Level } from '../engine/search.js';
@@ -54,6 +55,8 @@ type Phase =
   | 'human'
   /** Human is holding a pinch on a pit; seeds are lifted. */
   | 'held'
+  /** Human is sowing by hand: a seed drops in each pit the hand passes. */
+  | 'sowing'
   /** A scripted animation is playing. */
   | 'animating'
   /** Human to choose a bonus pit after a capture. */
@@ -95,6 +98,10 @@ const SIDES = ['right', 'left'] as const;
 const PIT_REACH = 0.034;
 /** Let go within this distance of the lifted pit to play it; farther away cancels. */
 const KEEP_REACH = 0.075;
+/** Carried seeds drop into the next pit when the hand is this close to its centre. */
+const DROP_REACH = 0.036;
+/** Where carried seeds sit around the hand. */
+const CARRY: Vec3[] = Array.from({ length: 96 }, (_, k) => seedSlot(k));
 /** Target code for the board's grab handle. */
 const HANDLE = 2000;
 
@@ -185,6 +192,10 @@ export class GameSystem extends createSystem({
   private dragSide: 'left' | 'right' | null = null;
   /** Pit centres in board space: x, z per pit, the human's pits first. */
   private centres = new Float32Array(0);
+
+  // Sowing by hand: the move being played and how far through its events we are.
+  private manual: { result: SowResult; index: number } | null = null;
+  private lostFor = 0;
 
   // Preview of the move under the hand: where it ends and what it captures.
   private previewPit = -1;
@@ -856,6 +867,11 @@ export class GameSystem extends createSystem({
     const pit = this.heldPit;
     this.heldPit = -1;
     this.heldSide = null;
+    if (this.manual) {
+      this.manual = null;
+      this.previewState = null;
+      this.view.showMarks();
+    }
     if (pit < 0) return;
     const list = this.pitSeeds[HUMAN][pit];
     for (const id of this.hand.splice(0)) {
@@ -907,7 +923,7 @@ export class GameSystem extends createSystem({
     return best < pits ? best : 100 + (best - pits);
   }
 
-  private updateDirect(): void {
+  private updateDirect(delta: number): void {
     const xr = this.input.xr;
     this.directHover = -1;
     this.nearFrame = (this.nearFrame + 1) % 8;
@@ -943,28 +959,31 @@ export class GameSystem extends createSystem({
           this.onButton(this.view.buttons[code - 1000].action);
         } else if (code >= 0) {
           this.pressPit(code >= 100 ? AI : HUMAN, code % 100);
-          if (this.phase === 'held') this.heldSide = side;
+          if (this.phase === 'held') {
+            this.heldSide = side;
+            this.prepareManual();
+          }
         }
       }
-      if (this.phase === 'held' && this.heldSide === side && !select.active) {
-        // Let go over the pit: play it. Let go elsewhere (or hand lost): put back.
-        let keep = false;
-        if (tracked && this.heldPit >= 0) {
+      if (this.heldSide === side && this.manual) {
+        // The seeds ride in the hand. Carried over the next pit they start
+        // dropping, one per pit; let go before that and they go back.
+        if (tracked) {
           this.view.root.worldToLocal(this.local.copy(this.pinch));
-          keep =
-            Math.hypot(
-              this.centres[this.heldPit * 2] - this.local.x,
-              this.centres[this.heldPit * 2 + 1] - this.local.z,
-            ) < KEEP_REACH;
-        }
-        if (keep) {
-          const pit = this.heldPit;
-          this.heldPit = -1;
-          this.heldSide = null;
-          this.beginSow(HUMAN, pit, true);
+          this.carryToHand();
+          this.lostFor = 0;
         } else {
-          this.cancelHold();
+          this.lostFor += delta;
         }
+        const gone = !select.active || this.lostFor > 0.4;
+        if (this.phase === 'held') {
+          const first = this.manual.result.events[this.manual.index];
+          if (gone) this.cancelHold();
+          else if (tracked && first?.type === 'drop' && this.overPit(first.pit)) {
+            this.phase = 'sowing';
+          }
+        }
+        if (this.phase === 'sowing') this.stepManual(tracked, gone);
       }
       if (now >= 0 && this.directHover < 0) this.directHover = now;
     }
@@ -975,6 +994,113 @@ export class GameSystem extends createSystem({
     this.view.setHandle(
       this.dragSide ? 'held' : this.directHover === HANDLE ? 'near' : 'idle',
     );
+  }
+
+  /** The human just lifted `heldPit` by hand: work out the move it starts. */
+  private prepareManual(): void {
+    const result = sow(this.state, this.heldPit);
+    this.manual = { result, index: result.events[0]?.type === 'lift' ? 1 : 0 };
+    this.lostFor = 0;
+    this.showSowMarks();
+  }
+
+  /** Is the hand (already in board space in `this.local`) over one of the human's pits? */
+  private overPit(pit: number): boolean {
+    return (
+      this.local.y < TOP_Y + 0.16 &&
+      Math.hypot(
+        this.centres[pit * 2] - this.local.x,
+        this.centres[pit * 2 + 1] - this.local.z,
+      ) < DROP_REACH
+    );
+  }
+
+  /** Keep the carried seeds clustered at the hand. */
+  private carryToHand(): void {
+    for (let k = 0; k < this.hand.length; k++) {
+      const id = this.hand[k];
+      if (this.moving[id]) {
+        this.moving[id] = 0;
+        this.movingCount -= 1;
+      }
+      const slot = CARRY[Math.min(k, CARRY.length - 1)];
+      const x = this.local.x + slot[0] * 0.6;
+      const y = Math.max(this.local.y, TOP_Y + 0.012) + slot[1] * 0.6;
+      const z = this.local.z + slot[2] * 0.6;
+      this.pos[id * 3] = x;
+      this.pos[id * 3 + 1] = y;
+      this.pos[id * 3 + 2] = z;
+      this.view.setSeed(id, x, y, z);
+    }
+    this.view.commitSeeds();
+  }
+
+  /** Rings while sowing by hand: the next pit (gold), where the move ends (white), captures (red). */
+  private showSowMarks(): void {
+    const manual = this.manual;
+    if (!manual) return;
+    const marks: { player: Player; pit: number; colour: number }[] = [];
+    let end = -1;
+    for (let i = manual.index; i < manual.result.events.length; i++) {
+      const event = manual.result.events[i];
+      if (event.type === 'drop') {
+        if (marks.length === 0) marks.push({ player: HUMAN, pit: event.pit, colour: GOLD });
+        end = event.pit;
+      } else if (event.type === 'capture') {
+        for (const taken of event.pits) marks.push({ player: AI, pit: taken, colour: RED });
+      }
+    }
+    if (end >= 0 && end !== marks[0]?.pit) marks.splice(1, 0, { player: HUMAN, pit: end, colour: WHITE });
+    this.view.showMarks(marks);
+  }
+
+  /** One frame of sowing by hand. `gone`: the pinch opened or the hand was lost. */
+  private stepManual(tracked: boolean, gone: boolean): void {
+    const manual = this.manual;
+    if (!manual) return;
+    for (;;) {
+      const event = manual.result.events[manual.index];
+      if (gone || !event || event.type === 'capture' || event.type === 'capped') {
+        this.finishManual();
+        return;
+      }
+      if (event.type === 'lift') {
+        // The last seed landed on others: they all come up into the hand.
+        this.liftPit(HUMAN, event.pit);
+        manual.index += 1;
+        this.showSowMarks();
+        continue;
+      }
+      if (tracked && this.overPit(event.pit)) {
+        this.dropInto(HUMAN, event.pit);
+        manual.index += 1;
+        this.showSowMarks();
+      }
+      return;
+    }
+  }
+
+  /** Hand the rest of the move (if any) to the scripted animation, then apply it. */
+  private finishManual(): void {
+    const manual = this.manual;
+    if (!manual) return;
+    const { result, index } = manual;
+    const pit = this.heldPit;
+    this.manual = null;
+    this.heldPit = -1;
+    this.heldSide = null;
+    this.mover = HUMAN;
+    this.hintPit = -1;
+    this.previewState = null;
+    this.view.showMarks();
+    report('sow', { player: HUMAN, pit, lesson: this.lesson, move: this.state.moveCount, byHand: index });
+    if (this.teach) this.tip = this.sowTip(HUMAN, result.events, result.captured);
+    this.scriptSow(HUMAN, result.events.slice(index), false);
+    this.runScript(() => {
+      this.state = result.state;
+      this.verify();
+      this.afterSow(HUMAN);
+    });
   }
 
   /** Ring where the move from `pit` would end and what it would capture (-1 clears). */
@@ -1095,7 +1221,7 @@ export class GameSystem extends createSystem({
     }
 
     if (this.direct) {
-      this.updateDirect();
+      this.updateDirect(delta);
     } else {
       this.directHover = -1;
       if (this.dragSide) {
@@ -1130,6 +1256,12 @@ export class GameSystem extends createSystem({
       this.view.showHighlight(h.player, h.pit, h.colour);
       this.view.hideLabel();
       this.setPreview(-1);
+      return;
+    }
+    if (this.manual) {
+      // Sowing by hand shows its own rings.
+      this.view.hideHighlight();
+      this.view.hideLabel();
       return;
     }
     // The pit under the hand: at the pinch point (hands) or under the ray (mouse, controller).
@@ -1198,7 +1330,10 @@ export class GameSystem extends createSystem({
           todo = `${pinch} the glowing pit`;
           break;
         case 'held':
-          todo = this.direct ? 'Let go to play it · move away to cancel' : 'Let go to sow';
+          todo = this.direct ? 'Carry the seeds over the gold ring' : 'Let go to sow';
+          break;
+        case 'sowing':
+          todo = 'Follow the gold ring · or let go';
           break;
         case 'bonus':
           todo = `${pinch} one of their pits`;
@@ -1235,7 +1370,10 @@ export class GameSystem extends createSystem({
           line1 = this.previewText || 'Your turn: pinch one of your pits';
           break;
         case 'held':
-          line1 = this.direct ? 'Let go to play it · move your hand away to cancel' : 'Let go to sow';
+          line1 = this.direct ? 'Carry the seeds over the gold ring · let go to put them back' : 'Let go to sow';
+          break;
+        case 'sowing':
+          line1 = 'One seed drops in each gold ring · let go and the rest sow themselves';
           break;
         case 'animating':
           line1 =
