@@ -9,6 +9,7 @@ import {
   PokeInteractable,
   Pressed,
   RayInteractable,
+  Vector3,
   type Entity,
 } from '@iwsdk/core';
 import type { AiRequest, AiResponse } from '../engine/ai.worker.js';
@@ -43,6 +44,7 @@ import {
 import { HudButton, Pit } from './pit-component.js';
 import { PlacementSystem } from './placement.js';
 import { Sounds } from './sounds.js';
+import { VirtualRoom } from './virtual-room.js';
 
 type Phase =
   /** Human to choose a pit. */
@@ -59,6 +61,25 @@ type Phase =
 const HUMAN: Player = 0;
 const AI: Player = 1;
 const LEVELS: Level[] = ['easy', 'medium', 'hard'];
+const GREEN = 0x9be28a;
+const TAUGHT_KEY = 'moruba_taught';
+const ROOM_KEY = 'moruba_room';
+
+function readFlag(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeFlag(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Not remembered; harmless.
+  }
+}
 const GOLD = 0xffd23a;
 const GREY = 0x9a8f80;
 const RED = 0xff6a3d;
@@ -113,6 +134,18 @@ export class GameSystem extends createSystem({
   private requestId = 0;
   private thinkStarted = 0;
   private hudText = '';
+  private hudEntity!: Entity;
+  private room = new VirtualRoom();
+  /** In the headset: show the virtual table and room instead of the real one. */
+  private virtualRoom = readFlag(ROOM_KEY) === 'virtual';
+  private rootWorld = new Vector3();
+
+  // "Teach me": tips on the panel and a suggested pit. On for a first game.
+  private teach = readFlag(TAUGHT_KEY) !== '1';
+  private teachEnds = false;
+  private tip = '';
+  private hintPit = -1;
+  private hintId = 0;
 
   init(): void {
     this.placement = this.world.getSystem(PlacementSystem)!;
@@ -121,8 +154,13 @@ export class GameSystem extends createSystem({
         new URL('../engine/ai.worker.ts', import.meta.url),
         { type: 'module' },
       );
-      this.worker.onmessage = (event: MessageEvent<AiResponse>) =>
-        this.onAiMove(event.data.id, event.data.move);
+      this.worker.onmessage = (event: MessageEvent<AiResponse>) => {
+        if (event.data.purpose === 'hint') {
+          this.onHint(event.data.id, event.data.move);
+        } else {
+          this.onAiMove(event.data.id, event.data.move);
+        }
+      };
       this.worker.onerror = () => {
         this.worker = null;
       };
@@ -154,6 +192,7 @@ export class GameSystem extends createSystem({
       () => this.worker?.terminate(),
     );
 
+    this.world.createTransformEntity(this.room.group, this.placement.rootEntity);
     this.buildBoard();
     this.startGame();
     // Read-only handle for automated checks and debugging.
@@ -185,8 +224,13 @@ export class GameSystem extends createSystem({
       entity.addComponent(PokeInteractable);
       this.entities.push(entity);
     }
+    this.hudEntity = this.world.createTransformEntity(
+      this.view.hudGroup,
+      this.viewEntity,
+    );
+    this.entities.push(this.hudEntity);
     for (const button of this.view.buttons) {
-      const entity = this.world.createTransformEntity(button.mesh, this.viewEntity);
+      const entity = this.world.createTransformEntity(button.mesh, this.hudEntity);
       entity.addComponent(HudButton, { action: button.action });
       entity.addComponent(RayInteractable);
       entity.addComponent(PokeInteractable);
@@ -215,6 +259,12 @@ export class GameSystem extends createSystem({
         case 'level':
           button.setLabel(`Level: ${this.level}`);
           break;
+        case 'teach':
+          button.setLabel(this.teach ? 'Teach me: on' : 'Teach me: off');
+          break;
+        case 'room':
+          button.setLabel(this.virtualRoom ? 'Room: virtual' : 'Room: yours');
+          break;
         case 'move':
           button.setLabel('Move board');
           break;
@@ -234,6 +284,70 @@ export class GameSystem extends createSystem({
     this.syncSeeds();
     this.phase = 'human';
     this.mover = HUMAN;
+    if (this.teachEnds) {
+      this.teachEnds = false;
+      this.teach = false;
+      this.updateButtons();
+    }
+    this.tip = this.teach
+      ? 'You own the two rows nearest you. Pinch a pit with 2 or more seeds; the green ring is a good one.'
+      : '';
+    this.requestHint();
+  }
+
+  // -------------------------------------------------------------- teaching
+
+  /** Ask for a suggested pit for the human (shown as a green ring). */
+  private requestHint(): void {
+    this.hintPit = -1;
+    this.hintId += 1;
+    if (!this.teach || this.phase !== 'human') return;
+    const request: AiRequest = {
+      id: this.hintId,
+      state: this.state,
+      level: 'medium',
+      purpose: 'hint',
+    };
+    if (this.worker) {
+      this.worker.postMessage(request);
+    } else {
+      this.hintPit = legalPits(this.state)[0] ?? -1;
+    }
+  }
+
+  private onHint(id: number, move: Move | null): void {
+    if (id !== this.hintId || this.phase !== 'human' || !move) return;
+    this.hintPit = move.pit;
+  }
+
+  /** The fullest opponent pit: the obvious bonus pick. */
+  private bestBonus(): number {
+    let best = -1;
+    let most = 0;
+    const pits = this.state.pits[AI];
+    for (let i = 0; i < pits.length; i++) {
+      if (pits[i] > most) {
+        most = pits[i];
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  private sowTip(player: Player, events: SowEvent[], captured: boolean): string {
+    const lifts = events.filter((e) => e.type === 'lift').length;
+    if (player === HUMAN) {
+      if (captured) {
+        return 'Your last seed fell in an empty pit of your inner row, facing their seeds: you capture that pit and the one behind it.';
+      }
+      if (lifts > 1) {
+        return 'When your last seed lands in a pit that has seeds, you scoop them all up and keep sowing. An empty pit ends the move.';
+      }
+      return 'Your last seed fell in an empty pit, so the move ends there.';
+    }
+    return captured
+      ? 'Moruba ended in its empty inner pit facing your seeds, so it captures. Keep your inner row guarded or empty.'
+      : 'Moruba plays the far two rows by the same rules.';
   }
 
   /** Rebuild every seed's place from the engine state (start of game, or to repair a mismatch). */
@@ -436,6 +550,8 @@ export class GameSystem extends createSystem({
   private beginSow(player: Player, pit: number, alreadyLifted: boolean): void {
     const result = sow(this.state, pit);
     this.mover = player;
+    this.hintPit = -1;
+    if (this.teach) this.tip = this.sowTip(player, result.events, result.captured);
     this.scriptSow(player, result.events, alreadyLifted);
     this.runScript(() => {
       this.state = result.state;
@@ -453,6 +569,9 @@ export class GameSystem extends createSystem({
     }
     if (player === HUMAN) {
       this.phase = 'bonus';
+      if (this.teach) {
+        this.tip = 'A capture also wins you any one other pit of theirs. The green ring marks their fullest.';
+      }
       return;
     }
     const pit = this.pendingBonus.shift();
@@ -481,10 +600,19 @@ export class GameSystem extends createSystem({
     if (outcome(this.state).over) {
       this.phase = 'over';
       this.sounds.gameOver();
+      if (this.teach) {
+        this.tip = 'A player with no move left loses. That was your first game: Teach me turns off for the next one.';
+        this.teachEnds = true;
+        writeFlag(TAUGHT_KEY, '1');
+      }
       return;
     }
     if (this.state.toMove === HUMAN) {
       this.phase = 'human';
+      if (this.teach && this.state.moveCount > 1) {
+        this.tip = 'Try to end in an empty pit of your inner row, opposite their seeds. Point at any pit to count it.';
+      }
+      this.requestHint();
       return;
     }
     this.phase = 'thinking';
@@ -494,6 +622,7 @@ export class GameSystem extends createSystem({
       id: this.requestId,
       state: this.state,
       level: this.level,
+      purpose: 'move',
     };
     if (this.worker) {
       this.worker.postMessage(request);
@@ -583,6 +712,20 @@ export class GameSystem extends createSystem({
         this.level = LEVELS[(LEVELS.indexOf(this.level) + 1) % LEVELS.length];
         this.updateButtons();
         break;
+      case 'teach':
+        this.teach = !this.teach;
+        this.teachEnds = false;
+        this.tip = this.teach
+          ? 'Teach me is on: tips appear here and a green ring suggests a pit.'
+          : '';
+        this.updateButtons();
+        this.requestHint();
+        break;
+      case 'room':
+        this.virtualRoom = !this.virtualRoom;
+        writeFlag(ROOM_KEY, this.virtualRoom ? 'virtual' : 'real');
+        this.updateButtons();
+        break;
       case 'move':
         this.placement.startPlacing();
         break;
@@ -593,6 +736,14 @@ export class GameSystem extends createSystem({
   // --------------------------------------------------------------- frame
 
   update(delta: number): void {
+    // The virtual room always shows in the browser; in the headset it is a choice.
+    const showRoom = this.virtualRoom || !this.placement.inXR;
+    this.room.group.visible = showRoom;
+    if (showRoom) {
+      this.placement.root.getWorldPosition(this.rootWorld);
+      this.room.setFloorDrop(this.rootWorld.y);
+    }
+
     // Holding a pinch (or the mouse button) fast-forwards the sowing.
     let fast = this.pointerDown;
     if (this.placement.inXR) {
@@ -661,8 +812,15 @@ export class GameSystem extends createSystem({
       }
     }
     if (!shown) {
-      this.view.hideHighlight();
       this.view.hideLabel();
+      // Teach me: ring the suggested pit while nothing else is pointed at.
+      if (this.teach && !this.placement.busy && this.phase === 'human' && this.hintPit >= 0) {
+        this.view.showHighlight(HUMAN, this.hintPit, GREEN);
+      } else if (this.teach && !this.placement.busy && this.phase === 'bonus' && this.bestBonus() >= 0) {
+        this.view.showHighlight(AI, this.bestBonus(), GREEN);
+      } else {
+        this.view.hideHighlight();
+      }
     }
   }
 
@@ -707,7 +865,7 @@ export class GameSystem extends createSystem({
       this.state,
       AI,
     )}     Captured: you ${this.state.captured[HUMAN]} · Moruba ${this.state.captured[AI]}`;
-    const text = `${line1}\n${line2}`;
+    const text = `${line1}\n${line2}\n${this.teach || this.teachEnds ? this.tip : ''}`;
     if (text !== this.hudText) {
       this.hudText = text;
       this.view.setHud(text);

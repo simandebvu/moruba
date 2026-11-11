@@ -109,7 +109,8 @@ export class BoardView {
   readonly root = new Group();
   readonly pitTargets: PitTarget[] = [];
   readonly buttons: ButtonView[] = [];
-  readonly hudMesh: Mesh;
+  /** Tilted frame holding the status panel and the buttons. */
+  readonly hudGroup = new Group();
   readonly seedCount: number;
 
   private seeds: InstancedMesh;
@@ -257,46 +258,61 @@ export class BoardView {
 
     // Heads-up panel on the far side, leaning back towards the player.
     const hudWidth = Math.min(0.4, width);
-    this.hud = new TextPlane(hudWidth, 0.07, 2600, (ctx, w, h, text) => {
+    const hudHeight = 0.092;
+    this.hud = new TextPlane(hudWidth, hudHeight, 2600, (ctx, w, h, text) => {
       panel(ctx, w, h, 'rgba(24, 16, 10, 0.88)');
-      const [line1, line2 = ''] = text.split('\n');
+      const [line1, line2 = '', tip = ''] = text.split('\n');
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#ffd23a';
-      ctx.font = `bold ${Math.round(h * 0.3)}px ${FONT}`;
-      ctx.fillText(line1, w / 2, h * 0.34, w * 0.94);
+      ctx.font = `bold ${Math.round(h * 0.2)}px ${FONT}`;
+      ctx.fillText(line1, w / 2, h * (tip ? 0.2 : 0.32), w * 0.94);
       ctx.fillStyle = '#f3ead9';
-      ctx.font = `${Math.round(h * 0.22)}px ${FONT}`;
-      ctx.fillText(line2, w / 2, h * 0.72, w * 0.94);
+      ctx.font = `${Math.round(h * 0.15)}px ${FONT}`;
+      ctx.fillText(line2, w / 2, h * (tip ? 0.45 : 0.68), w * 0.94);
+      if (tip) {
+        // Wrap the tip over at most two lines.
+        ctx.fillStyle = '#bfe6a8';
+        ctx.font = `${Math.round(h * 0.135)}px ${FONT}`;
+        const words = tip.split(' ');
+        const lines: string[] = [''];
+        for (const word of words) {
+          const trial = lines[lines.length - 1] ? `${lines[lines.length - 1]} ${word}` : word;
+          if (ctx.measureText(trial).width > w * 0.92 && lines.length < 2) lines.push(word);
+          else lines[lines.length - 1] = trial;
+        }
+        lines.forEach((line, k) =>
+          ctx.fillText(line, w / 2, h * (0.68 + k * 0.17), w * 0.94),
+        );
+      }
     });
-    this.hudMesh = this.hud.mesh;
-    this.hudMesh.name = 'hud';
-    const tilt = -0.5;
-    const hudZ = -(depth / 2 + 0.035);
-    this.hudMesh.position.set(0, 0.085, hudZ - 0.02);
-    this.hudMesh.rotation.x = tilt;
-    this.root.add(this.hudMesh);
-    this.texts.push(this.hud);
+    this.hudGroup.name = 'hud';
+    this.hudGroup.position.set(0, 0.012, -(depth / 2 + 0.03));
+    this.hudGroup.rotation.x = -0.5;
+    this.root.add(this.hudGroup);
 
-    const actions = ['new', 'size', 'level', 'move'];
+    const actions = ['new', 'size', 'level', 'teach', 'room', 'move'];
+    const perRow = 3;
     const gap = 0.006;
-    const buttonWidth = (hudWidth - gap * (actions.length - 1)) / actions.length;
+    const buttonHeight = 0.028;
+    const buttonWidth = (hudWidth - gap * (perRow - 1)) / perRow;
+    const rows = Math.ceil(actions.length / perRow);
     actions.forEach((action, i) => {
-      const text = new TextPlane(buttonWidth, 0.03, 2600, (ctx, w, h, label) => {
+      const text = new TextPlane(buttonWidth, buttonHeight, 2600, (ctx, w, h, label) => {
         panel(ctx, w, h, 'rgba(92, 56, 24, 0.95)');
         ctx.fillStyle = '#fff3d6';
-        ctx.font = `bold ${Math.round(h * 0.44)}px ${FONT}`;
+        ctx.font = `bold ${Math.round(h * 0.46)}px ${FONT}`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(label, w / 2, h / 2 + h * 0.03, w * 0.9);
       });
+      const row = Math.floor(i / perRow);
       text.mesh.name = `button-${action}`;
       text.mesh.position.set(
-        -hudWidth / 2 + buttonWidth / 2 + i * (buttonWidth + gap),
-        0.03,
-        hudZ + 0.008,
+        -hudWidth / 2 + buttonWidth / 2 + (i % perRow) * (buttonWidth + gap),
+        buttonHeight / 2 + (rows - 1 - row) * (buttonHeight + gap),
+        0,
       );
-      text.mesh.rotation.x = tilt;
       this.texts.push(text);
       this.buttons.push({
         action,
@@ -304,6 +320,14 @@ export class BoardView {
         setLabel: (label) => text.set(label),
       });
     });
+    this.hud.mesh.name = 'hud-panel';
+    this.hud.mesh.position.set(
+      0,
+      rows * (buttonHeight + gap) + hudHeight / 2,
+      0,
+    );
+    this.hudGroup.add(this.hud.mesh);
+    this.texts.push(this.hud);
   }
 
   setSeed(id: number, x: number, y: number, z: number): void {

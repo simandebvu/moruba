@@ -31,10 +31,13 @@ Open the same link **without** `?check` and enter mixed reality. A Moruba board 
 | 13 | Point at (or dip a finger into) one of the pits nearest you. | Gold ring and a seed count. Pinch (or touch) and let go: seeds hop round your two rows with a clack. | |
 | 14 | Wait for Moruba's reply, play 3 or 4 turns. Hold a pinch in the air while seeds move. | Sowing speeds up while you hold. No accidental moves. | |
 
+| 15 | Touch or pinch **Room: yours**. | The real room is replaced by a dim warm room with a wooden table under the board. Press again to get your room back. | |
+
 ## Also tell me
 - Did step 4 work without Space Setup, or only after it?
 - How far from the cube's real spot was it after the reload (step 9), roughly in cm?
 - Was the pinch comfortable to aim at the table 40–60 cm in front of you? Any mis-fires?
+- In the game: is the panel text (three lines, the green one is the tip) readable on the Quest 2 display?
 - In the game: which felt better for choosing a pit, pointing-and-pinching from a distance or touching the pit with a fingertip? Were the pits big enough?
 - Any stutter, or the browser asking for anything unexpected.
 
