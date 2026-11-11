@@ -127,6 +127,8 @@ export class BoardView {
   private seedSize: Vector3[] = [];
   private seedPosition = new Vector3();
   private highlight: Mesh;
+  /** Extra rings for the move preview: where it ends, what it captures. */
+  private marks: Mesh[] = [];
   private label: TextPlane;
   private hud: TextPlane;
   private lesson: TextPlane;
@@ -370,6 +372,15 @@ export class BoardView {
     this.highlight.visible = false;
     this.root.add(this.highlight);
     this.disposables.push(ringGeometry, ringMaterial);
+    for (let i = 0; i < 3; i++) {
+      const material = ringMaterial.clone();
+      const mark = new Mesh(ringGeometry, material);
+      mark.name = `pit-mark-${i}`;
+      mark.visible = false;
+      this.root.add(mark);
+      this.marks.push(mark);
+      this.disposables.push(material);
+    }
 
     this.label = new TextPlane(0.034, 0.034, 4000, (ctx, w, h, text) => {
       ctx.fillStyle = 'rgba(24, 16, 10, 0.9)';
@@ -522,6 +533,18 @@ export class BoardView {
 
   hideHighlight(): void {
     this.highlight.visible = false;
+  }
+
+  /** Ring up to three more pits (the move preview). Call with nothing to clear. */
+  showMarks(marks: readonly { player: Player; pit: number; colour: number }[] = []): void {
+    this.marks.forEach((mesh, i) => {
+      const mark = marks[i];
+      mesh.visible = mark !== undefined;
+      if (!mark) return;
+      const [x, , z] = pitCentre(this.options, mark.player, mark.pit);
+      mesh.position.set(x, TOP_Y + 0.0012, z);
+      (mesh.material as MeshBasicMaterial).color.setHex(mark.colour);
+    });
   }
 
   /** Show a count bubble above a pit, leaning back towards the human's seat. */

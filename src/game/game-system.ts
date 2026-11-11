@@ -6,11 +6,11 @@
 import {
   createSystem,
   Hovered,
-  PokeInteractable,
   Pressed,
   RayInteractable,
   Vector3,
   type Entity,
+  type PlaneGeometry,
 } from '@iwsdk/core';
 import type { AiRequest, AiResponse } from '../engine/ai.worker.js';
 import {
@@ -33,6 +33,7 @@ import {
 } from '../engine/moruba.js';
 import { searchLevel, type Level } from '../engine/search.js';
 import { BoardView } from './board-view.js';
+import { pinchPoint } from './hands.js';
 import { LESSON, LESSON_BONUS, LESSON_END, lessonState } from './lesson.js';
 import {
   CARRY_HEIGHT,
@@ -88,6 +89,12 @@ function writeFlag(key: string, value: string): void {
 const GOLD = 0xffd23a;
 const GREY = 0x9a8f80;
 const RED = 0xff6a3d;
+const WHITE = 0xffffff;
+const SIDES = ['right', 'left'] as const;
+/** Pinch this close (metres, across the board) to a pit's centre to choose it. */
+const PIT_REACH = 0.034;
+/** Let go within this distance of the lifted pit to play it; farther away cancels. */
+const KEEP_REACH = 0.075;
 
 interface Step {
   at: number;
@@ -160,6 +167,25 @@ export class GameSystem extends createSystem({
   private readSince = 0;
   /** A mouse press arrived this frame (the browser's "pinch anywhere"). */
   private tapped = false;
+
+  // Direct hand play (headset, hands): the pit or button at the pinch point.
+  // Codes: -1 nothing, player * 100 + pit, or 1000 + button number.
+  private pinch = new Vector3();
+  private local = new Vector3();
+  private nearHistory = {
+    left: new Int16Array(8).fill(-1),
+    right: new Int16Array(8).fill(-1),
+  };
+  private nearFrame = 0;
+  private directHover = -1;
+  private heldSide: 'left' | 'right' | null = null;
+  /** Pit centres in board space: x, z per pit, the human's pits first. */
+  private centres = new Float32Array(0);
+
+  // Preview of the move under the hand: where it ends and what it captures.
+  private previewPit = -1;
+  private previewState: State | null = null;
+  private previewText = '';
   /** Dev notes: the last phase reported, and when the AI was asked. */
   private reportedPhase = '';
   private askedAt = 0;
@@ -204,9 +230,9 @@ export class GameSystem extends createSystem({
       this.queries.pressedPits.subscribe('disqualify', (entity) =>
         this.onPitReleased(entity),
       ),
-      this.queries.pressedButtons.subscribe('qualify', (entity) =>
-        this.onButton(String(entity.getValue(HudButton, 'action'))),
-      ),
+      this.queries.pressedButtons.subscribe('qualify', (entity) => {
+        if (!this.direct) this.onButton(String(entity.getValue(HudButton, 'action')));
+      }),
       () => this.worker?.terminate(),
     );
 
@@ -242,7 +268,6 @@ export class GameSystem extends createSystem({
       const entity = this.world.createTransformEntity(target.mesh, this.viewEntity);
       entity.addComponent(Pit, { player: target.player, index: target.index });
       entity.addComponent(RayInteractable);
-      entity.addComponent(PokeInteractable);
       this.entities.push(entity);
     }
     this.hudEntity = this.world.createTransformEntity(
@@ -254,9 +279,18 @@ export class GameSystem extends createSystem({
       const entity = this.world.createTransformEntity(button.mesh, this.hudEntity);
       entity.addComponent(HudButton, { action: button.action });
       entity.addComponent(RayInteractable);
-      entity.addComponent(PokeInteractable);
       this.entities.push(entity);
     }
+    const pits = loopSize(this.options);
+    this.centres = new Float32Array(pits * 4);
+    for (const player of [0, 1] as const) {
+      for (let pit = 0; pit < pits; pit++) {
+        const c = pitCentre(this.options, player, pit);
+        this.centres[(player * pits + pit) * 2] = c[0];
+        this.centres[(player * pits + pit) * 2 + 1] = c[2];
+      }
+    }
+    this.previewState = null;
     const n = this.view.seedCount;
     this.pos = new Float32Array(n * 3);
     this.from = new Float32Array(n * 3);
@@ -765,10 +799,26 @@ export class GameSystem extends createSystem({
     };
   }
 
+  /**
+   * In the headset with hands, pits and buttons answer to a pinch made right
+   * at them (see `updateDirect`), not to the pointing ray: a ray pinch from a
+   * distance and a brushing fingertip both chose things by accident.
+   */
+  private get direct(): boolean {
+    if (!this.placement.inXR) return false;
+    const xr = this.input.xr;
+    return xr.isPrimary('hand', 'left') || xr.isPrimary('hand', 'right');
+  }
+
   private onPitPressed(entity: Entity): void {
+    if (this.direct) return;
+    const { player, index } = this.pitOf(entity);
+    this.pressPit(player, index);
+  }
+
+  private pressPit(player: Player, index: number): void {
     this.sounds.unlock();
     if (this.placement.busy) return;
-    const { player, index } = this.pitOf(entity);
     if (this.phase === 'human' && player === HUMAN) {
       const lessonPit = this.lesson >= 0 && this.lesson < LESSON.length ? LESSON[this.lesson].pit : index;
       if (index !== lessonPit || !legalPits(this.state).includes(index)) {
@@ -788,11 +838,140 @@ export class GameSystem extends createSystem({
   }
 
   private onPitReleased(entity: Entity): void {
-    if (this.phase !== 'held') return;
+    if (this.direct || this.phase !== 'held') return;
     const { player, index } = this.pitOf(entity);
     if (player !== HUMAN || index !== this.heldPit) return;
     this.heldPit = -1;
     this.beginSow(HUMAN, index, true);
+  }
+
+  /** Put the lifted seeds back: the player changed their mind. */
+  private cancelHold(): void {
+    const pit = this.heldPit;
+    this.heldPit = -1;
+    this.heldSide = null;
+    if (pit < 0) return;
+    const list = this.pitSeeds[HUMAN][pit];
+    for (const id of this.hand.splice(0)) {
+      list.push(id);
+      this.moveSeed(id, this.slotIn(HUMAN, pit, list.length - 1), 0.15, 0.003);
+    }
+    this.phase = 'human';
+    this.sounds.lift();
+  }
+
+  /** The pit or button at a world point, as a code (see `directHover`). */
+  private targetAt(point: Vector3): number {
+    const buttons = this.view.buttons;
+    for (let i = 0; i < buttons.length; i++) {
+      const mesh = buttons[i].mesh;
+      mesh.worldToLocal(this.local.copy(point));
+      const size = (mesh.geometry as PlaneGeometry).parameters;
+      if (
+        Math.abs(this.local.x) < size.width / 2 + 0.004 &&
+        Math.abs(this.local.y) < size.height / 2 + 0.004 &&
+        Math.abs(this.local.z) < 0.04
+      ) {
+        return 1000 + i;
+      }
+    }
+    this.view.root.worldToLocal(this.local.copy(point));
+    if (this.local.y < TOP_Y - 0.03 || this.local.y > TOP_Y + 0.11) return -1;
+    const pits = this.centres.length / 4;
+    let best = -1;
+    let nearest = PIT_REACH * PIT_REACH;
+    for (let i = 0; i < pits * 2; i++) {
+      const dx = this.centres[i * 2] - this.local.x;
+      const dz = this.centres[i * 2 + 1] - this.local.z;
+      const d = dx * dx + dz * dz;
+      if (d < nearest) {
+        nearest = d;
+        best = i;
+      }
+    }
+    if (best < 0) return -1;
+    return best < pits ? best : 100 + (best - pits);
+  }
+
+  private updateDirect(): void {
+    const xr = this.input.xr;
+    this.directHover = -1;
+    this.nearFrame = (this.nearFrame + 1) % 8;
+    for (const side of SIDES) {
+      const tracked = pinchPoint(this, side, this.pinch);
+      const now = tracked ? this.targetAt(this.pinch) : -1;
+      const history = this.nearHistory[side];
+      // Closing the fingers drags the pinch point: trust where it was a few
+      // frames earlier.
+      const before = history[(this.nearFrame + 3) % 8];
+      history[this.nearFrame] = now;
+      const select = xr.getSelectState(side);
+      if (select.start && !this.placement.busy) {
+        const code = before >= 0 ? before : now;
+        if (code >= 1000) {
+          this.onButton(this.view.buttons[code - 1000].action);
+        } else if (code >= 0) {
+          this.pressPit(code >= 100 ? AI : HUMAN, code % 100);
+          if (this.phase === 'held') this.heldSide = side;
+        }
+      }
+      if (this.phase === 'held' && this.heldSide === side && !select.active) {
+        // Let go over the pit: play it. Let go elsewhere (or hand lost): put back.
+        let keep = false;
+        if (tracked && this.heldPit >= 0) {
+          this.view.root.worldToLocal(this.local.copy(this.pinch));
+          keep =
+            Math.hypot(
+              this.centres[this.heldPit * 2] - this.local.x,
+              this.centres[this.heldPit * 2 + 1] - this.local.z,
+            ) < KEEP_REACH;
+        }
+        if (keep) {
+          const pit = this.heldPit;
+          this.heldPit = -1;
+          this.heldSide = null;
+          this.beginSow(HUMAN, pit, true);
+        } else {
+          this.cancelHold();
+        }
+      }
+      if (now >= 0 && this.directHover < 0) this.directHover = now;
+    }
+    const buttons = this.view.buttons;
+    for (let i = 0; i < buttons.length; i++) {
+      buttons[i].mesh.scale.setScalar(this.directHover === 1000 + i ? 1.12 : 1);
+    }
+  }
+
+  /** Ring where the move from `pit` would end and what it would capture (-1 clears). */
+  private setPreview(pit: number): void {
+    if (pit === this.previewPit && this.state === this.previewState) return;
+    this.previewPit = pit;
+    this.previewState = this.state;
+    if (pit < 0) {
+      this.previewText = '';
+      this.view.showMarks();
+      return;
+    }
+    const result = sow(this.state, pit);
+    let end = pit;
+    let seeds = 0;
+    const marks: { player: Player; pit: number; colour: number }[] = [];
+    for (const event of result.events) {
+      if (event.type === 'drop') end = event.pit;
+      if (event.type === 'capture') {
+        for (const taken of event.pits) {
+          seeds += this.state.pits[AI][taken];
+          marks.push({ player: AI, pit: taken, colour: RED });
+        }
+      }
+    }
+    marks.unshift({ player: HUMAN, pit: end, colour: WHITE });
+    this.view.showMarks(marks);
+    this.previewText =
+      seeds > 0
+        ? `This move captures ${seeds} seeds, plus a pit you choose`
+        : 'This move ends in the white ring: no capture';
   }
 
   private onButton(action: string): void {
@@ -881,6 +1060,9 @@ export class GameSystem extends createSystem({
       this.startAiMove(move);
     }
 
+    if (this.direct) this.updateDirect();
+    else this.directHover = -1;
+
     if (this.phase === 'reading' && !this.placement.busy) {
       let tap = this.tapped;
       if (this.placement.inXR) {
@@ -905,32 +1087,48 @@ export class GameSystem extends createSystem({
       const h = this.scriptHighlight;
       this.view.showHighlight(h.player, h.pit, h.colour);
       this.view.hideLabel();
+      this.setPreview(-1);
       return;
     }
-    let shown = false;
+    // The pit under the hand: at the pinch point (hands) or under the ray (mouse, controller).
+    let player: Player = HUMAN;
+    let index = -1;
     if (!this.placement.busy) {
-      for (const entity of this.queries.hoveredPits.entities) {
-        const { player, index } = this.pitOf(entity);
-        const count =
-          this.phase === 'held' && player === HUMAN && index === this.heldPit
-            ? this.hand.length
-            : this.pitSeeds[player][index].length;
-        const actionable =
-          (this.phase === 'human' &&
-            player === HUMAN &&
-            legalPits(this.state).includes(index)) ||
-          (this.phase === 'held' && player === HUMAN && index === this.heldPit) ||
-          (this.phase === 'bonus' && player === AI && count > 0);
-        this.view.showHighlight(
-          player,
-          index,
-          actionable ? (this.phase === 'bonus' ? RED : GOLD) : GREY,
-        );
-        this.view.showLabel(player, index, count);
-        shown = true;
-        break;
+      if (this.direct) {
+        if (this.directHover >= 0 && this.directHover < 1000) {
+          player = this.directHover >= 100 ? AI : HUMAN;
+          index = this.directHover % 100;
+        }
+      } else {
+        for (const entity of this.queries.hoveredPits.entities) {
+          ({ player, index } = this.pitOf(entity));
+          break;
+        }
       }
     }
+    let shown = false;
+    let preview = this.phase === 'held' ? this.heldPit : -1;
+    if (index >= 0) {
+      const count =
+        this.phase === 'held' && player === HUMAN && index === this.heldPit
+          ? this.hand.length
+          : this.pitSeeds[player][index].length;
+      const playable =
+        this.phase === 'human' && player === HUMAN && legalPits(this.state).includes(index);
+      const actionable =
+        playable ||
+        (this.phase === 'held' && player === HUMAN && index === this.heldPit) ||
+        (this.phase === 'bonus' && player === AI && count > 0);
+      this.view.showHighlight(
+        player,
+        index,
+        actionable ? (this.phase === 'bonus' ? RED : GOLD) : GREY,
+      );
+      this.view.showLabel(player, index, count);
+      shown = true;
+      if (playable) preview = index;
+    }
+    this.setPreview(preview);
     if (!shown) {
       this.view.hideLabel();
       // Teach me and the lesson: ring the suggested pit while nothing else is pointed at.
@@ -958,7 +1156,7 @@ export class GameSystem extends createSystem({
           todo = `${pinch} the glowing pit`;
           break;
         case 'held':
-          todo = 'Let go to sow';
+          todo = this.direct ? 'Let go to play it · move away to cancel' : 'Let go to sow';
           break;
         case 'bonus':
           todo = `${pinch} one of their pits`;
@@ -992,10 +1190,10 @@ export class GameSystem extends createSystem({
     } else {
       switch (this.phase) {
         case 'human':
-          line1 = 'Your turn: pinch one of your pits';
+          line1 = this.previewText || 'Your turn: pinch one of your pits';
           break;
         case 'held':
-          line1 = 'Let go to sow';
+          line1 = this.direct ? 'Let go to play it · move your hand away to cancel' : 'Let go to sow';
           break;
         case 'animating':
           line1 =
