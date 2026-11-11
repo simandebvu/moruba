@@ -1,81 +1,74 @@
 /**
- * The opponent's hand: a pale, see-through hand that reaches in from the far
- * side of the board to scoop and sow Moruba's moves. The group's origin is the
- * point between its fingertips, where carried seeds sit.
+ * The opponent's presence on the board: a small warm light, like a firefly,
+ * that drifts in from the far side, hovers over the pit Moruba picks and
+ * carries its seeds from pit to pit. (A modelled hand was tried first and
+ * looked unsettling; an abstract light reads as "someone is playing" without
+ * that.) The group's origin is where carried seeds sit.
  */
 
 import {
-  CapsuleGeometry,
+  AdditiveBlending,
+  CanvasTexture,
   Group,
   Mesh,
-  MeshStandardMaterial,
+  MeshBasicMaterial,
   SphereGeometry,
+  Sprite,
+  SpriteMaterial,
   Vector3,
 } from '@iwsdk/core';
 
-const OPACITY = 0.62;
+function glowTexture(): CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    const gradient = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gradient.addColorStop(0, 'rgba(255, 236, 190, 1)');
+    gradient.addColorStop(0.25, 'rgba(255, 200, 110, 0.55)');
+    gradient.addColorStop(0.6, 'rgba(255, 160, 60, 0.14)');
+    gradient.addColorStop(1, 'rgba(255, 140, 40, 0)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, 128, 128);
+  }
+  return new CanvasTexture(canvas);
+}
 
 export class GhostHand {
   readonly group = new Group();
-  private material = new MeshStandardMaterial({
-    color: 0xffe6b8,
-    emissive: 0x7a5a2a,
-    emissiveIntensity: 0.55,
-    roughness: 0.6,
+  private texture = glowTexture();
+  private coreGeometry = new SphereGeometry(0.01, 16, 12);
+  private coreMaterial = new MeshBasicMaterial({
+    color: 0xfff1cf,
     transparent: true,
     opacity: 0,
   });
-  private geometries: { dispose(): void }[] = [];
+  private haloMaterial = new SpriteMaterial({
+    map: this.texture,
+    blending: AdditiveBlending,
+    transparent: true,
+    depthWrite: false,
+    opacity: 0,
+  });
+  private halo = new Sprite(this.haloMaterial);
   private target = new Vector3();
   private rest = new Vector3();
   private shown = false;
   private fade = 0;
-  private bob = 0;
+  private time = 0;
 
   constructor() {
-    this.group.name = 'ghost-hand';
+    this.group.name = 'opponent-light';
     this.group.visible = false;
-    const add = (
-      geometry: SphereGeometry | CapsuleGeometry,
-      x: number,
-      y: number,
-      z: number,
-      rx = 0,
-      rz = 0,
-    ): Mesh => {
-      const mesh = new Mesh(geometry, this.material);
-      mesh.position.set(x, y, z);
-      mesh.rotation.set(rx, 0, rz);
-      this.group.add(mesh);
-      this.geometries.push(geometry);
-      return mesh;
-    };
-    // The opponent sits on the -Z side, so the wrist is towards -Z and the
-    // fingers curl down and forward (+Z) to the origin.
-    const palm = add(new SphereGeometry(1, 20, 14), 0, 0.05, -0.04);
-    palm.scale.set(0.04, 0.014, 0.046);
-    const finger = new CapsuleGeometry(0.0078, 0.034, 4, 10);
-    const tip = new CapsuleGeometry(0.0068, 0.024, 4, 10);
-    this.geometries.push(finger, tip);
-    [-0.027, -0.009, 0.009, 0.027].forEach((x, i) => {
-      const shorter = i === 0 || i === 3 ? 0.004 : 0;
-      // Two segments per finger: out from the knuckle, then down to the tip.
-      const first = new Mesh(finger, this.material);
-      first.position.set(x, 0.041, 0.013 - shorter);
-      first.rotation.x = 1.15;
-      const second = new Mesh(tip, this.material);
-      second.position.set(x * 0.8, 0.019, 0.026 - shorter);
-      second.rotation.x = 0.25;
-      this.group.add(first, second);
-    });
-    // Thumb, coming round from the side to meet the fingertips.
-    add(new CapsuleGeometry(0.0085, 0.03, 4, 10), 0.04, 0.034, -0.018, 0.9, -0.75);
-    add(new CapsuleGeometry(0.0075, 0.022, 4, 10), 0.024, 0.014, 0.004, 0.5, -0.9);
-    // Wrist and forearm, rising back towards the opponent's seat.
-    add(new CapsuleGeometry(0.021, 0.15, 4, 12), 0, 0.075, -0.165, 1.32);
+    const core = new Mesh(this.coreGeometry, this.coreMaterial);
+    // A little above the carried seeds, so it lights them from over the top.
+    core.position.y = 0.03;
+    this.halo.position.y = 0.03;
+    this.halo.scale.setScalar(0.15);
+    this.group.add(core, this.halo);
   }
 
-  /** Where the hand waits, out of the way (board space). */
+  /** Where the light waits, out of the way (board space). */
   setRest(x: number, y: number, z: number): void {
     this.rest.set(x, y, z);
     if (!this.shown) this.group.position.copy(this.rest);
@@ -92,18 +85,23 @@ export class GhostHand {
   }
 
   update(delta: number): void {
-    this.fade += ((this.shown ? 1 : 0) - this.fade) * Math.min(1, delta * 6);
+    this.fade += ((this.shown ? 1 : 0) - this.fade) * Math.min(1, delta * 5);
     this.group.visible = this.fade > 0.02;
     if (!this.group.visible) return;
-    this.material.opacity = OPACITY * this.fade;
-    this.bob += delta;
-    this.group.position.lerp(this.target, Math.min(1, delta * 14));
-    this.group.position.y += Math.sin(this.bob * 2.4) * 0.0004;
+    this.time += delta;
+    const pulse = 1 + Math.sin(this.time * 5.5) * 0.08;
+    this.coreMaterial.opacity = this.fade;
+    this.haloMaterial.opacity = 0.9 * this.fade;
+    this.halo.scale.setScalar(0.15 * pulse);
+    this.group.position.lerp(this.target, Math.min(1, delta * 12));
+    this.group.position.y += Math.sin(this.time * 3.1) * 0.0005;
   }
 
   dispose(): void {
     this.group.removeFromParent();
-    this.material.dispose();
-    for (const geometry of this.geometries) geometry.dispose();
+    this.texture.dispose();
+    this.coreGeometry.dispose();
+    this.coreMaterial.dispose();
+    this.haloMaterial.dispose();
   }
 }

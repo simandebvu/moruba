@@ -490,17 +490,17 @@ export class BoardView {
     this.texts.push(this.hud);
 
     // Grab handle on the player's side: pinch and hold it to carry the board.
-    // Well clear of the nearest pits, so reaching for them never grabs it.
-    this.handleZ = depth / 2 + 0.06;
-    this.handle = new TextPlane(0.17, 0.026, 2600, (ctx, w, h, label) => {
+    // A wide bar, well clear of the nearest pits so reaching for them never grabs it.
+    this.handleZ = depth / 2 + 0.075;
+    this.handle = new TextPlane(0.28, 0.04, 2600, (ctx, w, h, label) => {
       panel(ctx, w, h, 'rgba(232, 201, 138, 0.96)');
       ctx.fillStyle = '#3a2410';
-      ctx.font = `bold ${Math.round(h * 0.5)}px ${FONT}`;
+      ctx.font = `bold ${Math.round(h * 0.44)}px ${FONT}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(label, w / 2, h / 2 + h * 0.03, w * 0.92);
     });
-    this.handle.set('Pinch and hold to move');
+    this.handle.set('Pinch here and hold to move the board');
     this.handle.mesh.name = 'board-handle';
     this.handle.mesh.position.set(0, 0.006, this.handleZ);
     this.handle.mesh.rotation.x = -Math.PI / 2 + 0.45;
@@ -631,8 +631,14 @@ export class BoardView {
   /** The handle swells while a hand is on it and says what letting go does. */
   setHandle(state: 'hidden' | 'idle' | 'near' | 'held'): void {
     this.handle.mesh.visible = state !== 'hidden';
-    this.handle.mesh.scale.setScalar(state === 'idle' ? 1 : 1.15);
-    this.handle.set(state === 'held' ? 'Let go to set it down' : 'Pinch and hold to move');
+    this.handle.mesh.scale.setScalar(state === 'idle' ? 1 : 1.12);
+    this.handle.set(
+      state === 'held'
+        ? 'Let go to set the board down'
+        : state === 'near'
+          ? 'Pinch now and hold'
+          : 'Pinch here and hold to move the board',
+    );
   }
 
   /** Show the lesson card in place of the status panel, or `null` to put the panel back. */

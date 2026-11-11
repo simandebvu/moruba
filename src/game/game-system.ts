@@ -202,6 +202,7 @@ export class GameSystem extends createSystem({
   // Sowing by hand: the move being played and how far through its events we are.
   private manual: { result: SowResult; index: number } | null = null;
   private lostFor = 0;
+  private heldAt = 0;
 
   // Preview of the move under the hand: where it ends and what it captures.
   private previewPit = -1;
@@ -954,10 +955,10 @@ export class GameSystem extends createSystem({
     }
     this.view.root.worldToLocal(this.local.copy(point));
     if (
-      Math.abs(this.local.x) < 0.09 &&
-      Math.abs(this.local.z - this.view.handleZ) < 0.022 &&
-      this.local.y > -0.03 &&
-      this.local.y < 0.06
+      Math.abs(this.local.x) < 0.16 &&
+      Math.abs(this.local.z - this.view.handleZ) < 0.045 &&
+      this.local.y > -0.07 &&
+      this.local.y < 0.11
     ) {
       return HANDLE;
     }
@@ -1001,7 +1002,7 @@ export class GameSystem extends createSystem({
         }
         continue;
       }
-      if (select.start && !this.placement.busy) {
+      if (select.start && !this.placement.busy && !this.manual) {
         // The handle only counts if the hand is still on it: a hand passing
         // over it on the way to a pit means the pit.
         const code = before >= 0 && !(before === HANDLE && now !== HANDLE) ? before : now;
@@ -1025,20 +1026,27 @@ export class GameSystem extends createSystem({
         // dropping, one per pit; let go before that and they go back.
         if (tracked) {
           this.view.root.worldToLocal(this.local.copy(this.pinch));
-          this.carryToHand();
+          this.carryToHand(delta);
           this.lostFor = 0;
         } else {
           this.lostFor += delta;
         }
-        const gone = !select.active || this.lostFor > 0.4;
+        // No need to keep pinching: the seeds stay with the hand. A second
+        // pinch means "do it for me" (or, before any seed has dropped and
+        // away from the pit, "put them back").
+        const again = select.start && this.clock - this.heldAt > 0.35;
+        const away = this.lostFor > 1.5;
         if (this.phase === 'held') {
           const first = this.manual.result.events[this.manual.index];
-          if (gone) this.cancelHold();
-          else if (tracked && first?.type === 'drop' && this.overPit(first.pit)) {
+          if (again && tracked && this.overPit(this.heldPit)) {
+            this.finishManual();
+          } else if (again || away) {
+            this.cancelHold();
+          } else if (tracked && first?.type === 'drop' && this.overPit(first.pit)) {
             this.phase = 'sowing';
           }
         }
-        if (this.phase === 'sowing') this.stepManual(tracked, gone);
+        if (this.phase === 'sowing') this.stepManual(tracked, again || away);
       }
       if (now >= 0 && this.directHover < 0) this.directHover = now;
     }
@@ -1056,6 +1064,7 @@ export class GameSystem extends createSystem({
     const result = sow(this.state, this.heldPit);
     this.manual = { result, index: result.events[0]?.type === 'lift' ? 1 : 0 };
     this.lostFor = 0;
+    this.heldAt = this.clock;
     this.showSowMarks();
   }
 
@@ -1070,8 +1079,9 @@ export class GameSystem extends createSystem({
     );
   }
 
-  /** Keep the carried seeds clustered at the hand. */
-  private carryToHand(): void {
+  /** Carried seeds drift after the hand in a loose cluster. */
+  private carryToHand(delta: number): void {
+    const ease = Math.min(1, delta * 16);
     for (let k = 0; k < this.hand.length; k++) {
       const id = this.hand[k];
       if (this.moving[id]) {
@@ -1079,12 +1089,15 @@ export class GameSystem extends createSystem({
         this.movingCount -= 1;
       }
       const slot = CARRY[Math.min(k, CARRY.length - 1)];
-      const x = this.local.x + slot[0] * 0.6;
-      const y = Math.max(this.local.y, TOP_Y + 0.012) + slot[1] * 0.6;
-      const z = this.local.z + slot[2] * 0.6;
-      this.pos[id * 3] = x;
-      this.pos[id * 3 + 1] = y;
-      this.pos[id * 3 + 2] = z;
+      const i = id * 3;
+      const x = this.pos[i] + (this.local.x + slot[0] * 0.6 - this.pos[i]) * ease;
+      const y =
+        this.pos[i + 1] +
+        (Math.max(this.local.y, TOP_Y + 0.012) + slot[1] * 0.6 - this.pos[i + 1]) * ease;
+      const z = this.pos[i + 2] + (this.local.z + slot[2] * 0.6 - this.pos[i + 2]) * ease;
+      this.pos[i] = x;
+      this.pos[i + 1] = y;
+      this.pos[i + 2] = z;
       this.view.setSeed(id, x, y, z);
     }
     this.view.commitSeeds();
@@ -1391,10 +1404,10 @@ export class GameSystem extends createSystem({
           todo = `${pinch} the glowing pit`;
           break;
         case 'held':
-          todo = this.direct ? 'Carry the seeds over the gold ring' : 'Let go to sow';
+          todo = this.direct ? 'Sweep your hand over the gold ring' : 'Let go to sow';
           break;
         case 'sowing':
-          todo = 'Follow the gold ring · or let go';
+          todo = 'Follow the gold ring · or pinch to finish';
           break;
         case 'bonus':
           todo = `${pinch} one of their pits`;
@@ -1431,10 +1444,10 @@ export class GameSystem extends createSystem({
           line1 = this.previewText || 'Your turn: pinch one of your pits';
           break;
         case 'held':
-          line1 = this.direct ? 'Carry the seeds over the gold ring · let go to put them back' : 'Let go to sow';
+          line1 = this.direct ? 'Sweep your hand over the gold ring · or pinch this pit again to play it' : 'Let go to sow';
           break;
         case 'sowing':
-          line1 = 'One seed drops in each gold ring · let go and the rest sow themselves';
+          line1 = 'A seed drops in each gold ring · pinch and the rest sow themselves';
           break;
         case 'animating':
           line1 =
