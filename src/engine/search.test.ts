@@ -58,6 +58,38 @@ describe('search', () => {
     expect(r.score).toBeGreaterThan(900_000);
   });
 
+  it('agrees with a plain minimax (the table and pruning change speed, not answers)', () => {
+    // Reference: exhaustive minimax, no pruning, no table, no quiescence.
+    const minimax = (s: State, depth: number, ply: number): number => {
+      const o = outcome(s);
+      if (o.over) {
+        if (o.winner === null) return 0;
+        return o.winner === s.toMove ? 1_000_000 - ply : -1_000_000 + ply;
+      }
+      if (depth === 0) return evaluate(s);
+      let best = -Infinity;
+      for (const m of legalMoves(s)) {
+        best = Math.max(best, -minimax(m.state, depth - 1, ply + 1));
+      }
+      return best;
+    };
+    const random = rng(7);
+    for (let game = 0; game < 6; game++) {
+      let s: State = newGame(QUICK);
+      // Walk to a random middle-game position.
+      for (let i = 0; i < 3 + game * 2 && !outcome(s).over; i++) {
+        const moves = legalMoves(s);
+        s = moves[Math.floor(random() * moves.length)].state;
+      }
+      if (outcome(s).over) continue;
+      for (const depth of [1, 2, 3]) {
+        const r = search(s, { depth, quiescence: 0, random });
+        // A forced win/loss stops the deepening early; compare at the depth reached.
+        expect(r.score).toBe(minimax(s, r.depth, 0));
+      }
+    }
+  });
+
   it('reports no move when the player cannot move', () => {
     const s = makeState([0, 0, 0, 0], [2, 2, 2, 2]);
     expect(search(s, { depth: 2, quiescence: 0 }).move).toBeNull();

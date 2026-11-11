@@ -89,22 +89,61 @@ function terminalScore(state: State, ply: number): number | null {
 
 class Timeout extends Error {}
 
+/** Transposition-table entry: what a previous visit to this position found. */
+interface Entry {
+  depth: number;
+  score: number;
+  /** 0 = exact, 1 = at least `score` (cut-off), 2 = at most `score`. */
+  bound: 0 | 1 | 2;
+  /** Code of the best move found (see moveCode), tried first next time. */
+  best: number;
+}
+
 interface Ctx {
   nodes: number;
   deadline: number;
   now: () => number;
   quiescence: number;
+  table: Map<string, Entry>;
 }
 
-function ordered(state: State): { move: Move; state: State; gain: number }[] {
+const TABLE_LIMIT = 300_000;
+
+function keyOf(state: State): string {
+  const [a, b] = state.pits;
+  let key = state.toMove === 0 ? 'a' : 'b';
+  for (let i = 0; i < a.length; i++) key += String.fromCharCode(48 + a[i]);
+  for (let i = 0; i < b.length; i++) key += String.fromCharCode(48 + b[i]);
+  // Close to the move limit the same position is worth something different.
+  const left = state.options.maxMoves - state.moveCount;
+  if (left < 24) key += `|${left}`;
+  return key;
+}
+
+function moveCode(move: Move): number {
+  return move.pit * 64 + (move.bonus.length > 0 ? move.bonus[0] + 1 : 0);
+}
+
+interface Child {
+  move: Move;
+  state: State;
+  gain: number;
+}
+
+/** Legal turns, biggest captures first; `first` (a move code) goes to the front. */
+function ordered(state: State, first = -1): Child[] {
   const me = state.toMove;
   const before = state.captured[me];
-  const list = legalMoves(state).map((m) => ({
+  const list: Child[] = legalMoves(state).map((m) => ({
     move: m.move,
     state: m.state,
     gain: m.state.captured[me] - before,
   }));
   list.sort((a, b) => b.gain - a.gain);
+  if (first >= 0) {
+    const i = list.findIndex((c) => moveCode(c.move) === first);
+    if (i > 0) list.unshift(list.splice(i, 1)[0]);
+  }
   return list;
 }
 
@@ -128,13 +167,44 @@ function negamax(
     best = evaluate(state);
     if (depth <= -ctx.quiescence || best >= beta) return best;
     if (best > alpha) alpha = best;
+    for (const child of ordered(state)) {
+      if (child.gain === 0) break; // sorted: no captures left
+      const score = -negamax(child.state, depth - 1, -beta, -alpha, ply + 1, ctx);
+      if (score > best) best = score;
+      if (best > alpha) alpha = best;
+      if (alpha >= beta) break;
+    }
+    return best;
   }
-  for (const child of ordered(state)) {
-    if (quiet && child.gain === 0) break; // sorted: no captures left
+
+  // Full-width node: reuse what an earlier visit to this position found.
+  const key = keyOf(state);
+  const entry = ctx.table.get(key);
+  if (entry && entry.depth >= depth) {
+    if (entry.bound === 0) return entry.score;
+    if (entry.bound === 1 && entry.score >= beta) return entry.score;
+    if (entry.bound === 2 && entry.score <= alpha) return entry.score;
+  }
+  const alpha0 = alpha;
+  let bestCode = -1;
+  for (const child of ordered(state, entry ? entry.best : -1)) {
     const score = -negamax(child.state, depth - 1, -beta, -alpha, ply + 1, ctx);
-    if (score > best) best = score;
+    if (score > best) {
+      best = score;
+      bestCode = moveCode(child.move);
+    }
     if (best > alpha) alpha = best;
     if (alpha >= beta) break;
+  }
+  // Win/loss scores depend on how deep they were found, so are not reusable.
+  if (Math.abs(best) < WIN - 1000) {
+    if (ctx.table.size >= TABLE_LIMIT) ctx.table.clear();
+    ctx.table.set(key, {
+      depth,
+      score: best,
+      bound: best <= alpha0 ? 2 : best >= beta ? 1 : 0,
+      best: bestCode,
+    });
   }
   return best;
 }
@@ -158,6 +228,7 @@ export function search(state: State, options: SearchOptions): SearchResult {
     deadline: now() + (options.timeMs ?? Infinity),
     now,
     quiescence: options.quiescence,
+    table: new Map(),
   };
   // Depth 0 fallback: best immediate gain.
   let result: SearchResult = {
@@ -171,6 +242,7 @@ export function search(state: State, options: SearchOptions): SearchResult {
       let alpha = -Infinity;
       let bestScore = -Infinity;
       let bestMoves: Move[] = [];
+      const scores = new Map<Child, number>();
       for (const child of root) {
         // Full window on ties so equal moves are found and can be varied.
         const score = -negamax(
@@ -181,6 +253,7 @@ export function search(state: State, options: SearchOptions): SearchResult {
           1,
           ctx,
         );
+        scores.set(child, score);
         if (score > bestScore) {
           bestScore = score;
           bestMoves = [child.move];
@@ -189,6 +262,9 @@ export function search(state: State, options: SearchOptions): SearchResult {
           bestMoves.push(child.move);
         }
       }
+      // Best first next time round: the deeper search then cuts off sooner.
+      // (Scores below the best are upper bounds, which is all ordering needs.)
+      root.sort((a, b) => (scores.get(b) ?? 0) - (scores.get(a) ?? 0));
       result = {
         move: bestMoves[Math.floor(random() * bestMoves.length)],
         score: bestScore,
