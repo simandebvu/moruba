@@ -44,6 +44,7 @@ import {
 } from './layout.js';
 import { HudButton, Pit } from './pit-component.js';
 import { PlacementSystem } from './placement.js';
+import { report } from '../report.js';
 import { Sounds } from './sounds.js';
 import { VirtualRoom } from './virtual-room.js';
 
@@ -342,6 +343,7 @@ export class GameSystem extends createSystem({
     this.mover = HUMAN;
     this.hintPit = stage.pit;
     this.lessonBody = stage.ask;
+    report('lesson-stage', { stage: index });
   }
 
   /** The move of a lesson stage has played out: let the player read about it. */
@@ -367,6 +369,7 @@ export class GameSystem extends createSystem({
   private finishLesson(): void {
     this.lesson = -1;
     writeFlag(LESSON_KEY, '1');
+    report('lesson-finished');
     const back = this.lessonReturn ?? this.options;
     this.lessonReturn = null;
     if (back !== this.options) {
@@ -635,6 +638,7 @@ export class GameSystem extends createSystem({
   private beginSow(player: Player, pit: number, alreadyLifted: boolean): void {
     const result = sow(this.state, pit);
     this.mover = player;
+    report('sow', { player, pit, lesson: this.lesson, move: this.state.moveCount });
     this.hintPit = -1;
     if (this.teach) this.tip = this.sowTip(player, result.events, result.captured);
     this.scriptSow(player, result.events, alreadyLifted);
@@ -937,7 +941,7 @@ export class GameSystem extends createSystem({
     const pinch = this.placement.inXR ? 'Pinch' : 'Click';
     let todo: string;
     if (this.placement.placing) {
-      todo = 'Point at your table and pinch to set the board down';
+      todo = 'Touch your table where the board should sit, then pinch';
     } else {
       switch (this.phase) {
         case 'human':
@@ -974,7 +978,7 @@ export class GameSystem extends createSystem({
     if (this.hudText.startsWith('lesson\n')) this.view.setLesson(null);
     let line1: string;
     if (this.placement.placing) {
-      line1 = 'Point at your table and pinch to set the board down';
+      line1 = 'Touch your table where the board should sit, then pinch';
     } else {
       switch (this.phase) {
         case 'human':

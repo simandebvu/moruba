@@ -5,8 +5,10 @@
  * - In XR: restored from the persistent anchor if we have a saved pose;
  *   otherwise dropped in front of the seated player at table height (snapped
  *   to a detected table plane when there is one).
- * - "Move board": the board follows the surface under either hand's ray and a
- *   pinch sets it down (WebXR hit-test).
+ * - "Move board" (and a first visit with no table known): the board follows
+ *   the player's fingertip, so they touch the table where it should sit, and a
+ *   pinch sets it down. This needs nothing from the headset's room scan: a
+ *   Quest 2 reports no table, and its hit-test only finds the floor.
  *
  * IWSDK keeps one persistent anchor per site and parents every XRAnchor
  * entity under it; it does not remember per-entity poses, so the board's pose
@@ -15,14 +17,8 @@
 
 import {
   createSystem,
-  DoubleSide,
-  EnvironmentRaycastTarget,
   Group,
-  Mesh,
-  MeshBasicMaterial,
   Quaternion,
-  RaycastSpace,
-  RingGeometry,
   Vector3,
   VisibilityState,
   XRAnchor,
@@ -65,11 +61,13 @@ type Mode =
   | 'browser'
   /** XR just started: waiting for tracking and the anchor to settle. */
   | 'settling'
-  /** The player is moving the board with a hand ray. */
+  /** The player is moving the board with a hand. */
   | 'placing'
   | 'placed';
 
 const UP = new Vector3(0, 1, 0);
+/** Fingertip to board centre while placing: half the board's depth and a little. */
+const REACH = 0.15;
 
 export class PlacementSystem extends createSystem({
   planes: { required: [XRPlane] },
@@ -90,15 +88,13 @@ export class PlacementSystem extends createSystem({
   private realPosition = new Vector3();
   private realQuaternion = new Quaternion();
   private awaitingUuid = false;
-  private raySources: Record<'left' | 'right', unknown> = {
-    left: undefined,
-    right: undefined,
-  };
   private uuidPoll = 0;
   /** Dev only: seconds until the next status note to the Mac, and how many are left. */
   private reportIn = 0;
   private reportsLeft = 0;
-  private reticles!: Record<'left' | 'right', Entity>;
+  /** Smoothed spot the board is heading for while it follows a hand. */
+  private follow = new Vector3();
+  private following = false;
 
   private headPos = new Vector3();
   private headDir = new Vector3();
@@ -125,21 +121,6 @@ export class PlacementSystem extends createSystem({
     this.root.position.copy(BROWSER_POSITION);
     this.rootEntity = this.world.createTransformEntity(this.root);
 
-    const ringGeometry = new RingGeometry(0.02, 0.028, 32);
-    ringGeometry.rotateX(-Math.PI / 2);
-    const makeReticle = (side: 'left' | 'right'): Entity => {
-      const mesh = new Mesh(
-        ringGeometry,
-        new MeshBasicMaterial({ color: 0xffd23a, side: DoubleSide }),
-      );
-      mesh.name = `reticle-${side}`;
-      mesh.visible = false;
-      const entity = this.world.createTransformEntity(mesh);
-      this.aimReticle(entity, side);
-      return entity;
-    };
-    this.reticles = { left: makeReticle('left'), right: makeReticle('right') };
-
     this.cleanupFuncs.push(
       this.world.visibilityState.subscribe((state) => {
         const xr = state !== VisibilityState.NonImmersive;
@@ -149,29 +130,27 @@ export class PlacementSystem extends createSystem({
     );
   }
 
-  private aimReticle(entity: Entity, side: 'left' | 'right'): void {
-    entity.addComponent(EnvironmentRaycastTarget, {
-      space: side === 'left' ? RaycastSpace.Left : RaycastSpace.Right,
-      maxDistance: 3,
-    });
-  }
-
   /**
-   * The SDK binds a hit-test ray to the input source that was active when it
-   * was requested. When that changes (controller put down, hand appears, hand
-   * lost and found) the old ray goes dead, so ask again.
+   * World position of a hand's index fingertip (or of a controller), written
+   * to `out`. False when that hand is not tracked this frame.
    */
-  private refreshRays(): void {
-    for (const side of ['left', 'right'] as const) {
-      const source = this.input.xr.getPrimaryInputSource(side);
-      if (source === this.raySources[side]) continue;
-      this.raySources[side] = source;
-      const entity = this.reticles[side];
-      if (entity.hasComponent(EnvironmentRaycastTarget)) {
-        entity.removeComponent(EnvironmentRaycastTarget);
-      }
-      if (source) this.aimReticle(entity, side);
+  private handPoint(side: 'left' | 'right', out: Vector3): boolean {
+    const source = this.input.xr.getPrimaryInputSource(side) as unknown as
+      | XRInputSource
+      | undefined;
+    if (!source) return false;
+    const joint = source.hand?.get('index-finger-tip');
+    if (joint) {
+      const frame = this.xrFrame as XRFrame | undefined;
+      const space = this.xrManager.getReferenceSpace();
+      const pose = frame?.getJointPose && space ? frame.getJointPose(joint, space) : null;
+      if (!pose) return false;
+      const p = pose.transform.position;
+      this.player.localToWorld(out.set(p.x, p.y, p.z));
+      return true;
     }
+    this.player.raySpaces[side].getWorldPosition(out);
+    return true;
   }
 
   /** Let the player set the board down somewhere else (XR only). */
@@ -184,6 +163,7 @@ export class PlacementSystem extends createSystem({
       this.cooldown = 0.4;
       return;
     }
+    this.following = false;
     this.setMode('placing');
   }
 
@@ -338,7 +318,6 @@ export class PlacementSystem extends createSystem({
     this.modeTime += delta;
     if (this.cooldown > 0) this.cooldown -= delta;
 
-    this.refreshRays();
     this.reportStatus(delta);
 
     if (this.mode === 'settling') {
@@ -374,6 +353,7 @@ export class PlacementSystem extends createSystem({
         } else {
           // No table known (a Quest 2 reports none): the player points at it.
           this.root.visible = true;
+          this.following = false;
           this.setMode('placing');
           return;
         }
@@ -386,48 +366,35 @@ export class PlacementSystem extends createSystem({
 
     if (this.mode === 'placing') {
       const xr = this.input.xr;
-      let aimed = false;
+      // The board's near edge sits just beyond the fingertip, at its height:
+      // touch the table and the board lies on it.
       for (const side of ['right', 'left'] as const) {
-        const reticle = this.reticles[side];
-        const object = reticle.object3D;
-        if (
-          !object ||
-          !reticle.hasComponent(EnvironmentRaycastTarget) ||
-          !reticle.getValue(EnvironmentRaycastTarget, 'xrHitTestResult')
-        ) {
-          continue;
-        }
-        aimed = true;
-        object.getWorldPosition(this.tmp);
-        this.setWorldPose(new Vector3().copy(this.tmp));
-        if (this.modeTime > 0.5 && xr.getSelectState(side).start) {
-          this.note = 'where you put it';
-          this.needsSave = true;
-          this.cooldown = 0.5;
-          this.setMode('placed');
-        }
+        if (!this.handPoint(side, this.tmp)) continue;
+        this.player.head.getWorldPosition(this.headPos);
+        this.headDir.set(this.tmp.x - this.headPos.x, 0, this.tmp.z - this.headPos.z);
+        if (this.headDir.lengthSq() > 1e-6) this.headDir.normalize();
+        this.tmp.addScaledVector(this.headDir, REACH);
+        this.tmp.y -= 0.012;
+        if (this.following) this.follow.lerp(this.tmp, Math.min(1, delta * 12));
+        else this.follow.copy(this.tmp);
+        this.following = true;
+        this.setWorldPose(this.follow);
         break;
       }
-      // Nothing under either hand: a pinch still sets the board down where it is,
-      // so the player is never stuck.
       if (
-        !aimed &&
         this.modeTime > 1 &&
         (xr.getSelectState('left').start || xr.getSelectState('right').start)
       ) {
-        this.note = 'in front of you';
+        this.note = this.following ? 'where you put it' : 'in front of you';
         this.needsSave = true;
+        this.root.getWorldPosition(this.tmp);
+        report('board-set-down', {
+          note: this.note,
+          board: [this.tmp.x, this.tmp.y, this.tmp.z].map((n) => Math.round(n * 100) / 100),
+        });
         this.cooldown = 0.5;
         this.setMode('placed');
       }
-    }
-
-    const showReticles = this.mode === 'placing';
-    for (const side of ['left', 'right'] as const) {
-      const object = this.reticles[side].object3D;
-      // The raycast system turns reticles on when it has a hit; keep them
-      // hidden unless the player is placing the board.
-      if (object && !showReticles) object.visible = false;
     }
 
     // Virtual room: the board leaves its real-room spot for a comfortable
