@@ -5,10 +5,11 @@
  * - In XR: restored from the persistent anchor if we have a saved pose;
  *   otherwise dropped in front of the seated player at table height (snapped
  *   to a detected table plane when there is one).
- * - "Move board" (and a first visit with no table known): the board follows
- *   the player's fingertip, so they touch the table where it should sit, and a
- *   pinch sets it down. This needs nothing from the headset's room scan: a
- *   Quest 2 reports no table, and its hit-test only finds the floor.
+ * - The player can carry it anywhere at any time: the game calls `beginDrag`,
+ *   `dragTo` and `endDrag` while a hand holds the board's handle. `startPlacing`
+ *   brings it back in front of the player. Nothing here needs the headset's
+ *   room scan (a Quest 2 reports no table, and its hit-test only finds the
+ *   floor), and no table is needed at all: the board can simply float.
  *
  * IWSDK keeps one persistent anchor per site and parents every XRAnchor
  * entity under it; it does not remember per-entity poses, so the board's pose
@@ -61,13 +62,11 @@ type Mode =
   | 'browser'
   /** XR just started: waiting for tracking and the anchor to settle. */
   | 'settling'
-  /** The player is moving the board with a hand. */
+  /** The player is carrying the board by its handle. */
   | 'placing'
   | 'placed';
 
 const UP = new Vector3(0, 1, 0);
-/** Fingertip to board centre while placing: half the board's depth and a little. */
-const REACH = 0.15;
 
 export class PlacementSystem extends createSystem({
   planes: { required: [XRPlane] },
@@ -92,9 +91,9 @@ export class PlacementSystem extends createSystem({
   /** Dev only: seconds until the next status note to the Mac, and how many are left. */
   private reportIn = 0;
   private reportsLeft = 0;
-  /** Smoothed spot the board is heading for while it follows a hand. */
+  /** While carried: where the board is, and its offset from the hand. */
   private follow = new Vector3();
-  private following = false;
+  private dragOffset = new Vector3();
 
   private headPos = new Vector3();
   private headDir = new Vector3();
@@ -131,41 +130,40 @@ export class PlacementSystem extends createSystem({
     );
   }
 
-  /**
-   * World position of a hand's index fingertip (or of a controller), written
-   * to `out`. False when that hand is not tracked this frame.
-   */
-  private handPoint(side: 'left' | 'right', out: Vector3): boolean {
-    const source = this.input.xr.getPrimaryInputSource(side) as unknown as
-      | XRInputSource
-      | undefined;
-    if (!source) return false;
-    const joint = source.hand?.get('index-finger-tip');
-    if (joint) {
-      const frame = this.xrFrame as XRFrame | undefined;
-      const space = this.xrManager.getReferenceSpace();
-      const pose = frame?.getJointPose && space ? frame.getJointPose(joint, space) : null;
-      if (!pose) return false;
-      const p = pose.transform.position;
-      this.player.localToWorld(out.set(p.x, p.y, p.z));
-      return true;
-    }
-    this.player.raySpaces[side].getWorldPosition(out);
+  /** Bring the board back in front of the player (XR only). */
+  startPlacing(): void {
+    if (this.mode !== 'placed') return;
+    this.placeInFront(!this.virtualApplied);
+    if (!this.virtualApplied) this.needsSave = true;
+    this.cooldown = 0.4;
+  }
+
+  /** A hand took hold of the board at world point `hand`. False if it cannot move now. */
+  beginDrag(hand: Vector3): boolean {
+    if (this.mode !== 'placed' || this.cooldown > 0) return false;
+    this.root.getWorldPosition(this.tmp);
+    this.dragOffset.copy(this.tmp).sub(hand);
+    this.setMode('placing');
     return true;
   }
 
-  /** Let the player set the board down somewhere else (XR only). */
-  startPlacing(): void {
-    if (this.mode !== 'placed') return;
-    if (this.virtualApplied) {
-      // Nothing real to point at in the virtual room: bring the table back
-      // in front of the player instead.
-      this.placeInFront(false);
-      this.cooldown = 0.4;
-      return;
-    }
-    this.following = false;
-    this.setMode('placing');
+  dragTo(hand: Vector3): void {
+    if (this.mode !== 'placing') return;
+    this.follow.copy(hand).add(this.dragOffset);
+    this.setWorldPose(this.follow);
+  }
+
+  endDrag(): void {
+    if (this.mode !== 'placing') return;
+    this.note = 'where you put it';
+    if (!this.virtualApplied) this.needsSave = true;
+    this.cooldown = 0.6;
+    this.root.getWorldPosition(this.tmp);
+    report('board-set-down', {
+      note: this.note,
+      board: [this.tmp.x, this.tmp.y, this.tmp.z].map((n) => Math.round(n * 100) / 100),
+    });
+    this.setMode('placed');
   }
 
   private setMode(mode: Mode): void {
@@ -341,64 +339,23 @@ export class PlacementSystem extends createSystem({
         this.root.updateWorldMatrix(true, false);
         this.root.getWorldPosition(this.tmp);
         this.player.head.getWorldPosition(this.headPos);
+        const below = this.headPos.y - this.tmp.y;
         restored =
-          Math.hypot(this.tmp.x - this.headPos.x, this.tmp.z - this.headPos.z) < 1.5 &&
-          Math.abs(this.tmp.y - this.headPos.y) < 1.4;
+          Math.hypot(this.tmp.x - this.headPos.x, this.tmp.z - this.headPos.z) < 0.9 &&
+          below > 0.1 &&
+          below < 0.9;
       }
       if (restored) {
         this.note = 'back where you left it';
       } else {
+        // No table needed: it floats in front of the player, who can carry it anywhere.
         this.placeInFront();
-        if (this.note === 'on your table') {
-          this.needsSave = true;
-        } else {
-          // No table known (a Quest 2 reports none): the player points at it.
-          this.root.visible = true;
-          this.following = false;
-          this.setMode('placing');
-          return;
-        }
+        this.needsSave = true;
       }
       this.root.visible = true;
       this.cooldown = 0.3;
       this.setMode('placed');
       return;
-    }
-
-    if (this.mode === 'placing') {
-      const xr = this.input.xr;
-      // The board's near edge sits just beyond the fingertip, at its height:
-      // touch the table and the board lies on it.
-      for (const side of ['right', 'left'] as const) {
-        if (!this.handPoint(side, this.tmp)) continue;
-        this.player.head.getWorldPosition(this.headPos);
-        this.headDir.set(this.tmp.x - this.headPos.x, 0, this.tmp.z - this.headPos.z);
-        if (this.headDir.lengthSq() > 1e-6) this.headDir.normalize();
-        this.tmp.addScaledVector(this.headDir, REACH);
-        this.tmp.y -= 0.012;
-        if (this.following) this.follow.lerp(this.tmp, Math.min(1, delta * 12));
-        else this.follow.copy(this.tmp);
-        this.following = true;
-        this.setWorldPose(this.follow);
-        break;
-      }
-      // Not in the first moments: a pinch left over from pressing "Move board"
-      // or from entering must not drop the board somewhere by accident.
-      if (
-        this.modeTime > 2 &&
-        (xr.getSelectState('left').start || xr.getSelectState('right').start)
-      ) {
-        this.note = this.following ? 'where you put it' : 'in front of you';
-        this.needsSave = true;
-        // Long enough to take the hand off the board before pits respond.
-        this.cooldown = 1.2;
-        this.root.getWorldPosition(this.tmp);
-        report('board-set-down', {
-          note: this.note,
-          board: [this.tmp.x, this.tmp.y, this.tmp.z].map((n) => Math.round(n * 100) / 100),
-        });
-        this.setMode('placed');
-      }
     }
 
     // Virtual room: the board leaves its real-room spot for a comfortable

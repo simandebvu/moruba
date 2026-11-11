@@ -95,6 +95,8 @@ const SIDES = ['right', 'left'] as const;
 const PIT_REACH = 0.034;
 /** Let go within this distance of the lifted pit to play it; farther away cancels. */
 const KEEP_REACH = 0.075;
+/** Target code for the board's grab handle. */
+const HANDLE = 2000;
 
 interface Step {
   at: number;
@@ -179,6 +181,8 @@ export class GameSystem extends createSystem({
   private nearFrame = 0;
   private directHover = -1;
   private heldSide: 'left' | 'right' | null = null;
+  /** The hand carrying the board by its handle, if any. */
+  private dragSide: 'left' | 'right' | null = null;
   /** Pit centres in board space: x, z per pit, the human's pits first. */
   private centres = new Float32Array(0);
 
@@ -321,7 +325,7 @@ export class GameSystem extends createSystem({
           button.setLabel(this.virtualRoom ? 'Room: virtual' : 'Room: yours');
           break;
         case 'move':
-          button.setLabel(this.virtualRoom ? 'Re-centre' : 'Move board');
+          button.setLabel('Bring board here');
           break;
       }
     }
@@ -876,6 +880,14 @@ export class GameSystem extends createSystem({
       }
     }
     this.view.root.worldToLocal(this.local.copy(point));
+    if (
+      Math.abs(this.local.x) < 0.095 &&
+      Math.abs(this.local.z - this.view.handleZ) < 0.03 &&
+      this.local.y > -0.035 &&
+      this.local.y < 0.075
+    ) {
+      return HANDLE;
+    }
     if (this.local.y < TOP_Y - 0.03 || this.local.y > TOP_Y + 0.11) return -1;
     const pits = this.centres.length / 4;
     let best = -1;
@@ -906,9 +918,24 @@ export class GameSystem extends createSystem({
       const before = history[(this.nearFrame + 3) % 8];
       history[this.nearFrame] = now;
       const select = xr.getSelectState(side);
+      if (this.dragSide === side) {
+        // Carrying the board: it follows the hand until the pinch opens.
+        if (!select.active) {
+          this.dragSide = null;
+          this.placement.endDrag();
+        } else if (tracked) {
+          this.placement.dragTo(this.pinch);
+        }
+        continue;
+      }
       if (select.start && !this.placement.busy) {
         const code = before >= 0 ? before : now;
-        if (code >= 1000) {
+        if (code === HANDLE) {
+          if (tracked && this.phase !== 'held' && this.placement.beginDrag(this.pinch)) {
+            this.dragSide = side;
+            this.sounds.lift();
+          }
+        } else if (code >= 1000) {
           this.onButton(this.view.buttons[code - 1000].action);
         } else if (code >= 0) {
           this.pressPit(code >= 100 ? AI : HUMAN, code % 100);
@@ -941,6 +968,9 @@ export class GameSystem extends createSystem({
     for (let i = 0; i < buttons.length; i++) {
       buttons[i].mesh.scale.setScalar(this.directHover === 1000 + i ? 1.12 : 1);
     }
+    this.view.setHandle(
+      this.dragSide ? 'held' : this.directHover === HANDLE ? 'near' : 'idle',
+    );
   }
 
   /** Ring where the move from `pit` would end and what it would capture (-1 clears). */
@@ -1060,8 +1090,16 @@ export class GameSystem extends createSystem({
       this.startAiMove(move);
     }
 
-    if (this.direct) this.updateDirect();
-    else this.directHover = -1;
+    if (this.direct) {
+      this.updateDirect();
+    } else {
+      this.directHover = -1;
+      if (this.dragSide) {
+        // Hands lost while carrying the board: set it down where it is.
+        this.dragSide = null;
+        this.placement.endDrag();
+      }
+    }
 
     if (this.phase === 'reading' && !this.placement.busy) {
       let tap = this.tapped;
@@ -1149,7 +1187,7 @@ export class GameSystem extends createSystem({
     const pinch = this.placement.inXR ? 'Pinch' : 'Click';
     let todo: string;
     if (this.placement.placing) {
-      todo = 'Touch your table where the board should sit, then pinch';
+      todo = 'Carry the board where you like, then let go';
     } else {
       switch (this.phase) {
         case 'human':
@@ -1186,7 +1224,7 @@ export class GameSystem extends createSystem({
     if (this.hudText.startsWith('lesson\n')) this.view.setLesson(null);
     let line1: string;
     if (this.placement.placing) {
-      line1 = 'Touch your table where the board should sit, then pinch';
+      line1 = 'Carry the board where you like, then let go';
     } else {
       switch (this.phase) {
         case 'human':

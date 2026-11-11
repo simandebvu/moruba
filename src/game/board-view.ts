@@ -132,6 +132,9 @@ export class BoardView {
   private label: TextPlane;
   private hud: TextPlane;
   private lesson: TextPlane;
+  private handle: TextPlane;
+  /** Centre of the grab handle along the board's depth (board space). */
+  readonly handleZ: number;
   private texts: TextPlane[] = [];
   private disposables: { dispose(): void }[] = [];
 
@@ -472,6 +475,23 @@ export class BoardView {
     this.hudGroup.add(this.hud.mesh);
     this.texts.push(this.hud);
 
+    // Grab handle on the player's side: pinch and hold it to carry the board.
+    this.handleZ = depth / 2 + 0.03;
+    this.handle = new TextPlane(0.17, 0.026, 2600, (ctx, w, h, label) => {
+      panel(ctx, w, h, 'rgba(232, 201, 138, 0.96)');
+      ctx.fillStyle = '#3a2410';
+      ctx.font = `bold ${Math.round(h * 0.5)}px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, w / 2, h / 2 + h * 0.03, w * 0.92);
+    });
+    this.handle.set('Pinch and hold to move');
+    this.handle.mesh.name = 'board-handle';
+    this.handle.mesh.position.set(0, 0.006, this.handleZ);
+    this.handle.mesh.rotation.x = -Math.PI / 2 + 0.45;
+    this.root.add(this.handle.mesh);
+    this.texts.push(this.handle);
+
     // "How to play" card: takes the status panel's place during the lesson,
     // with larger text. Lines: step, title, body (wrapped), what to do now.
     const lessonHeight = 0.17;
@@ -562,6 +582,12 @@ export class BoardView {
 
   setHud(text: string): void {
     this.hud.set(text);
+  }
+
+  /** The handle swells while a hand is on it and says what letting go does. */
+  setHandle(state: 'idle' | 'near' | 'held'): void {
+    this.handle.mesh.scale.setScalar(state === 'idle' ? 1 : 1.15);
+    this.handle.set(state === 'held' ? 'Let go to set it down' : 'Pinch and hold to move');
   }
 
   /** Show the lesson card in place of the status panel, or `null` to put the panel back. */
