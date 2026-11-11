@@ -129,6 +129,7 @@ export class BoardView {
   private highlight: Mesh;
   private label: TextPlane;
   private hud: TextPlane;
+  private lesson: TextPlane;
   private texts: TextPlane[] = [];
   private disposables: { dispose(): void }[] = [];
 
@@ -459,6 +460,44 @@ export class BoardView {
     );
     this.hudGroup.add(this.hud.mesh);
     this.texts.push(this.hud);
+
+    // "How to play" card: takes the status panel's place during the lesson,
+    // with larger text. Lines: step, title, body (wrapped), what to do now.
+    const lessonHeight = 0.17;
+    const lessonWidth = 0.42;
+    this.lesson = new TextPlane(lessonWidth, lessonHeight, 2600, (ctx, w, h, text) => {
+      panel(ctx, w, h, 'rgba(24, 16, 10, 0.94)');
+      const [step = '', title = '', body = '', todo = ''] = text.split('\n');
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#c9b89c';
+      ctx.font = `${Math.round(h * 0.075)}px ${FONT}`;
+      ctx.fillText(step, w / 2, h * 0.09, w * 0.92);
+      ctx.fillStyle = '#ffd23a';
+      ctx.font = `bold ${Math.round(h * 0.135)}px ${FONT}`;
+      ctx.fillText(title, w / 2, h * 0.235, w * 0.92);
+      ctx.fillStyle = '#f3ead9';
+      ctx.font = `${Math.round(h * 0.1)}px ${FONT}`;
+      const lines: string[] = [''];
+      for (const word of body.split(' ')) {
+        const last = lines[lines.length - 1];
+        const trial = last ? `${last} ${word}` : word;
+        if (last && ctx.measureText(trial).width > w * 0.9 && lines.length < 4) lines.push(word);
+        else lines[lines.length - 1] = trial;
+      }
+      const top = 0.57 - (lines.length - 1) * 0.056;
+      lines.forEach((line, k) =>
+        ctx.fillText(line, w / 2, h * (top + k * 0.112), w * 0.94),
+      );
+      ctx.fillStyle = '#9be28a';
+      ctx.font = `bold ${Math.round(h * 0.1)}px ${FONT}`;
+      ctx.fillText(todo, w / 2, h * 0.9, w * 0.94);
+    });
+    this.lesson.mesh.name = 'lesson-card';
+    this.lesson.mesh.visible = false;
+    this.lesson.mesh.position.set(0, rows * (buttonHeight + gap) + lessonHeight / 2, 0);
+    this.hudGroup.add(this.lesson.mesh);
+    this.texts.push(this.lesson);
   }
 
   setSeed(id: number, x: number, y: number, z: number): void {
@@ -500,6 +539,13 @@ export class BoardView {
 
   setHud(text: string): void {
     this.hud.set(text);
+  }
+
+  /** Show the lesson card in place of the status panel, or `null` to put the panel back. */
+  setLesson(text: string | null): void {
+    this.lesson.mesh.visible = text !== null;
+    this.hud.mesh.visible = text === null;
+    if (text !== null) this.lesson.set(text);
   }
 
   dispose(): void {

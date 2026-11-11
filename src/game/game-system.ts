@@ -33,6 +33,7 @@ import {
 } from '../engine/moruba.js';
 import { searchLevel, type Level } from '../engine/search.js';
 import { BoardView } from './board-view.js';
+import { LESSON, LESSON_BONUS, LESSON_END, lessonState } from './lesson.js';
 import {
   CARRY_HEIGHT,
   pitCentre,
@@ -56,6 +57,8 @@ type Phase =
   /** Human to choose a bonus pit after a capture. */
   | 'bonus'
   | 'thinking'
+  /** Lesson: the player is reading; a pinch anywhere continues. */
+  | 'reading'
   | 'over';
 
 const HUMAN: Player = 0;
@@ -64,6 +67,7 @@ const LEVELS: Level[] = ['easy', 'medium', 'hard'];
 const GREEN = 0x9be28a;
 const TAUGHT_KEY = 'moruba_taught';
 const ROOM_KEY = 'moruba_room';
+const LESSON_KEY = 'moruba_lesson';
 
 function readFlag(key: string): string | null {
   try {
@@ -147,6 +151,15 @@ export class GameSystem extends createSystem({
   private hintPit = -1;
   private hintId = 0;
 
+  // "How to play": -1 when off, else the stage (LESSON.length = closing card).
+  private lesson = -1;
+  private lessonBody = '';
+  /** Board size to go back to when the lesson ends. */
+  private lessonReturn: Options | null = null;
+  private readSince = 0;
+  /** A mouse press arrived this frame (the browser's "pinch anywhere"). */
+  private tapped = false;
+
   init(): void {
     this.placement = this.world.getSystem(PlacementSystem)!;
     try {
@@ -170,6 +183,7 @@ export class GameSystem extends createSystem({
 
     const down = () => {
       this.pointerDown = true;
+      this.tapped = true;
       this.sounds.unlock();
     };
     const up = () => {
@@ -194,12 +208,15 @@ export class GameSystem extends createSystem({
 
     this.world.createTransformEntity(this.room.group, this.placement.rootEntity);
     this.buildBoard();
-    this.startGame();
+    // First visit: learn the game before playing it.
+    if (readFlag(LESSON_KEY) === '1') this.startGame();
+    else this.startLesson();
     // Read-only handle for automated checks and debugging.
     (globalThis as { __moruba?: unknown }).__moruba = {
       state: () => this.state,
       phase: () => this.phase,
       hud: () => this.hudText,
+      lesson: () => this.lesson,
     };
   }
 
@@ -251,7 +268,7 @@ export class GameSystem extends createSystem({
     for (const button of this.view.buttons) {
       switch (button.action) {
         case 'new':
-          button.setLabel('New game');
+          button.setLabel(this.lesson >= 0 ? 'Skip lesson' : 'New game');
           break;
         case 'size':
           button.setLabel(this.options.cols === 8 ? 'Board: classic' : 'Board: quick');
@@ -260,7 +277,7 @@ export class GameSystem extends createSystem({
           button.setLabel(`Level: ${this.level}`);
           break;
         case 'teach':
-          button.setLabel(this.teach ? 'Teach me: on' : 'Teach me: off');
+          button.setLabel(this.lesson >= 0 ? 'Start again' : 'How to play');
           break;
         case 'room':
           button.setLabel(this.virtualRoom ? 'Room: virtual' : 'Room: yours');
@@ -293,6 +310,71 @@ export class GameSystem extends createSystem({
       ? 'You own the two rows nearest you. Pinch a pit with 2 or more seeds; the green ring is a good one.'
       : '';
     this.requestHint();
+  }
+
+  // ---------------------------------------------------------------- lesson
+
+  private startLesson(): void {
+    if (this.lesson < 0) this.lessonReturn = this.options;
+    if (this.options !== QUICK) {
+      this.options = QUICK;
+      this.buildBoard();
+    }
+    this.loadStage(0);
+    this.updateButtons();
+  }
+
+  private loadStage(index: number): void {
+    const stage = LESSON[index];
+    this.lesson = index;
+    this.requestId += 1; // drop any AI answer or hint still on its way
+    this.hintId += 1;
+    this.aiMove = null;
+    this.state = lessonState(stage);
+    this.steps = [];
+    this.onScriptEnd = null;
+    this.scriptHighlight = null;
+    this.heldPit = -1;
+    this.clock = 0;
+    this.cursor = 0;
+    this.syncSeeds();
+    this.phase = 'human';
+    this.mover = HUMAN;
+    this.hintPit = stage.pit;
+    this.lessonBody = stage.ask;
+  }
+
+  /** The move of a lesson stage has played out: let the player read about it. */
+  private lessonRead(): void {
+    this.phase = 'reading';
+    this.readSince = this.clock;
+    if (this.lesson < LESSON.length) this.lessonBody = LESSON[this.lesson].after;
+  }
+
+  private lessonNext(): void {
+    if (this.lesson >= LESSON.length) {
+      this.finishLesson();
+    } else if (this.lesson + 1 < LESSON.length) {
+      this.loadStage(this.lesson + 1);
+    } else {
+      this.lesson = LESSON.length;
+      this.lessonBody = LESSON_END.body;
+      this.readSince = this.clock;
+    }
+    this.sounds.lift();
+  }
+
+  private finishLesson(): void {
+    this.lesson = -1;
+    writeFlag(LESSON_KEY, '1');
+    const back = this.lessonReturn ?? this.options;
+    this.lessonReturn = null;
+    if (back !== this.options) {
+      this.options = back;
+      this.buildBoard();
+    }
+    this.startGame();
+    this.updateButtons();
   }
 
   // -------------------------------------------------------------- teaching
@@ -362,6 +444,7 @@ export class GameSystem extends createSystem({
       for (let pit = 0; pit < n; pit++) {
         const ids: number[] = [];
         for (let k = 0; k < this.state.pits[player][pit]; k++) {
+          if (id >= this.view.seedCount) break;
           ids.push(id);
           this.place(id, this.slotIn(player, pit, k));
           id += 1;
@@ -378,6 +461,8 @@ export class GameSystem extends createSystem({
         id += 1;
       }
     }
+    // Lesson positions use fewer seeds than the board holds: park the rest out of sight.
+    for (; id < this.view.seedCount; id++) this.place(id, [0, -50, 0]);
     this.view.commitSeeds();
   }
 
@@ -569,6 +654,7 @@ export class GameSystem extends createSystem({
     }
     if (player === HUMAN) {
       this.phase = 'bonus';
+      if (this.lesson >= 0) this.lessonBody = LESSON_BONUS;
       if (this.teach) {
         this.tip = 'A capture also wins you any one other pit of theirs. The green ring marks their fullest.';
       }
@@ -597,6 +683,10 @@ export class GameSystem extends createSystem({
   }
 
   private nextTurn(): void {
+    if (this.lesson >= 0) {
+      this.lessonRead();
+      return;
+    }
     if (outcome(this.state).over) {
       this.phase = 'over';
       this.sounds.gameOver();
@@ -671,7 +761,8 @@ export class GameSystem extends createSystem({
     if (this.placement.busy) return;
     const { player, index } = this.pitOf(entity);
     if (this.phase === 'human' && player === HUMAN) {
-      if (!legalPits(this.state).includes(index)) {
+      const lessonPit = this.lesson >= 0 && this.lesson < LESSON.length ? LESSON[this.lesson].pit : index;
+      if (index !== lessonPit || !legalPits(this.state).includes(index)) {
         this.sounds.deny();
         return;
       }
@@ -699,9 +790,16 @@ export class GameSystem extends createSystem({
     this.sounds.unlock();
     // While seeds are moving, a pinch means "faster", not a button press.
     if (this.placement.busy || this.phase === 'animating') return;
+    // A button press is not "pinch anywhere to continue".
+    this.readSince = this.clock;
+    if (this.lesson >= 0 && (action === 'size' || action === 'level')) {
+      this.sounds.deny();
+      return;
+    }
     switch (action) {
       case 'new':
-        this.startGame();
+        if (this.lesson >= 0) this.finishLesson();
+        else this.startGame();
         break;
       case 'size':
         this.options = this.options.cols === 8 ? QUICK : CLASSIC;
@@ -713,13 +811,10 @@ export class GameSystem extends createSystem({
         this.updateButtons();
         break;
       case 'teach':
-        this.teach = !this.teach;
+        // The lesson, then tips again through the next game.
+        this.teach = true;
         this.teachEnds = false;
-        this.tip = this.teach
-          ? 'Teach me is on: tips appear here and a green ring suggests a pit.'
-          : '';
-        this.updateButtons();
-        this.requestHint();
+        this.startLesson();
         break;
       case 'room':
         this.virtualRoom = !this.virtualRoom;
@@ -777,6 +872,16 @@ export class GameSystem extends createSystem({
       this.startAiMove(move);
     }
 
+    if (this.phase === 'reading' && !this.placement.busy) {
+      let tap = this.tapped;
+      if (this.placement.inXR) {
+        const xr = this.input.xr;
+        tap = xr.getSelectState('left').start || xr.getSelectState('right').start;
+      }
+      if (tap && this.clock - this.readSince > 0.8) this.lessonNext();
+    }
+    this.tapped = false;
+
     this.updateHover();
     this.updateHud();
   }
@@ -814,10 +919,11 @@ export class GameSystem extends createSystem({
     }
     if (!shown) {
       this.view.hideLabel();
-      // Teach me: ring the suggested pit while nothing else is pointed at.
-      if (this.teach && !this.placement.busy && this.phase === 'human' && this.hintPit >= 0) {
+      // Teach me and the lesson: ring the suggested pit while nothing else is pointed at.
+      const guide = this.teach || this.lesson >= 0;
+      if (guide && !this.placement.busy && this.phase === 'human' && this.hintPit >= 0) {
         this.view.showHighlight(HUMAN, this.hintPit, GREEN);
-      } else if (this.teach && !this.placement.busy && this.phase === 'bonus' && this.bestBonus() >= 0) {
+      } else if (guide && !this.placement.busy && this.phase === 'bonus' && this.bestBonus() >= 0) {
         this.view.showHighlight(AI, this.bestBonus(), GREEN);
       } else {
         this.view.hideHighlight();
@@ -825,7 +931,47 @@ export class GameSystem extends createSystem({
     }
   }
 
+  private updateLessonCard(): void {
+    const total = LESSON.length + 1;
+    const closing = this.lesson >= LESSON.length;
+    const pinch = this.placement.inXR ? 'Pinch' : 'Click';
+    let todo: string;
+    if (this.placement.placing) {
+      todo = 'Point at your table and pinch to set the board down';
+    } else {
+      switch (this.phase) {
+        case 'human':
+          todo = `${pinch} the glowing pit`;
+          break;
+        case 'held':
+          todo = 'Let go to sow';
+          break;
+        case 'bonus':
+          todo = `${pinch} one of their pits`;
+          break;
+        case 'reading':
+          todo = closing
+            ? `${pinch} anywhere to start a real game`
+            : `${pinch} anywhere to continue`;
+          break;
+        default:
+          todo = 'Watch the seeds…';
+      }
+    }
+    const title = closing ? LESSON_END.title : LESSON[this.lesson].title;
+    const text = `lesson\nHow to play · ${Math.min(this.lesson + 1, total)} of ${total}\n${title}\n${this.lessonBody}\n${todo}`;
+    if (text !== this.hudText) {
+      this.hudText = text;
+      this.view.setLesson(text.slice(text.indexOf('\n') + 1));
+    }
+  }
+
   private updateHud(): void {
+    if (this.lesson >= 0) {
+      this.updateLessonCard();
+      return;
+    }
+    if (this.hudText.startsWith('lesson\n')) this.view.setLesson(null);
     let line1: string;
     if (this.placement.placing) {
       line1 = 'Point at your table and pinch to set the board down';
@@ -848,6 +994,9 @@ export class GameSystem extends createSystem({
           break;
         case 'thinking':
           line1 = 'Moruba is thinking…';
+          break;
+        case 'reading':
+          line1 = '';
           break;
         case 'over': {
           const o = outcome(this.state);

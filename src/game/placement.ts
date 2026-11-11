@@ -38,6 +38,8 @@ const TABLE_MAX_Y = 1.0;
 const BROWSER_POSITION = new Vector3(0, 0.8, -0.3);
 
 interface SavedPose {
+  /** Set when the player (or a detected table) chose the spot; older saves lack it. */
+  chosen?: boolean;
   anchorUuid: string | null;
   position: [number, number, number];
   quaternion: [number, number, number, number];
@@ -289,6 +291,7 @@ export class PlacementSystem extends createSystem({
 
   private save(): void {
     const pose: SavedPose = {
+      chosen: true,
       anchorUuid: readStorage(ANCHOR_UUID_KEY),
       position: [this.root.position.x, this.root.position.y, this.root.position.z],
       quaternion: [
@@ -345,17 +348,35 @@ export class PlacementSystem extends createSystem({
       if (!attached && this.modeTime < 3) return;
       const saved = this.pendingRestore;
       this.pendingRestore = null;
+      let restored = false;
       if (
         attached &&
-        saved?.anchorUuid &&
+        saved?.chosen &&
+        saved.anchorUuid &&
         saved.anchorUuid === readStorage(ANCHOR_UUID_KEY)
       ) {
         this.root.position.fromArray(saved.position);
         this.root.quaternion.fromArray(saved.quaternion);
+        // Only if it is still within reach: the player may be sitting elsewhere.
+        this.root.updateWorldMatrix(true, false);
+        this.root.getWorldPosition(this.tmp);
+        this.player.head.getWorldPosition(this.headPos);
+        restored =
+          Math.hypot(this.tmp.x - this.headPos.x, this.tmp.z - this.headPos.z) < 1.5 &&
+          Math.abs(this.tmp.y - this.headPos.y) < 1.4;
+      }
+      if (restored) {
         this.note = 'back where you left it';
       } else {
         this.placeInFront();
-        this.needsSave = true;
+        if (this.note === 'on your table') {
+          this.needsSave = true;
+        } else {
+          // No table known (a Quest 2 reports none): the player points at it.
+          this.root.visible = true;
+          this.setMode('placing');
+          return;
+        }
       }
       this.root.visible = true;
       this.cooldown = 0.3;
@@ -365,6 +386,7 @@ export class PlacementSystem extends createSystem({
 
     if (this.mode === 'placing') {
       const xr = this.input.xr;
+      let aimed = false;
       for (const side of ['right', 'left'] as const) {
         const reticle = this.reticles[side];
         const object = reticle.object3D;
@@ -375,6 +397,7 @@ export class PlacementSystem extends createSystem({
         ) {
           continue;
         }
+        aimed = true;
         object.getWorldPosition(this.tmp);
         this.setWorldPose(new Vector3().copy(this.tmp));
         if (this.modeTime > 0.5 && xr.getSelectState(side).start) {
@@ -384,6 +407,18 @@ export class PlacementSystem extends createSystem({
           this.setMode('placed');
         }
         break;
+      }
+      // Nothing under either hand: a pinch still sets the board down where it is,
+      // so the player is never stuck.
+      if (
+        !aimed &&
+        this.modeTime > 1 &&
+        (xr.getSelectState('left').start || xr.getSelectState('right').start)
+      ) {
+        this.note = 'in front of you';
+        this.needsSave = true;
+        this.cooldown = 0.5;
+        this.setMode('placed');
       }
     }
 
