@@ -67,6 +67,10 @@ export class SpikeSystem extends createSystem({
   /** Saved pose waiting for the anchor group before it can be applied. */
   private pendingRestore: SavedPose | null = null;
   private anchorNote = 'none yet';
+  private raySources: Record<'left' | 'right', unknown> = {
+    left: undefined,
+    right: undefined,
+  };
 
   private board!: Mesh;
   private canvas!: HTMLCanvasElement;
@@ -97,10 +101,6 @@ export class SpikeSystem extends createSystem({
       mesh.name = `reticle-${space}`;
       mesh.visible = false;
       const entity = this.world.createTransformEntity(mesh);
-      entity.addComponent(EnvironmentRaycastTarget, {
-        space: space === 'left' ? RaycastSpace.Left : RaycastSpace.Right,
-        maxDistance: 3,
-      });
       return entity;
     };
     this.reticles = { left: makeReticle('left'), right: makeReticle('right') };
@@ -143,6 +143,39 @@ export class SpikeSystem extends createSystem({
           this.anchorNote = 'none yet';
         }
       }),
+    );
+  }
+
+  /**
+   * The SDK binds a hit-test ray to the input source active when it was
+   * requested; when that changes (controller put down, hand appears) the old
+   * ray goes dead, so ask again.
+   */
+  private refreshRays(): void {
+    for (const side of ['left', 'right'] as const) {
+      const source = this.input.xr.getPrimaryInputSource(side);
+      if (source === this.raySources[side]) continue;
+      this.raySources[side] = source;
+      const entity = this.reticles[side];
+      if (entity.hasComponent(EnvironmentRaycastTarget)) {
+        entity.removeComponent(EnvironmentRaycastTarget);
+      }
+      if (source) {
+        entity.addComponent(EnvironmentRaycastTarget, {
+          space: side === 'left' ? RaycastSpace.Left : RaycastSpace.Right,
+          maxDistance: 3,
+        });
+      } else if (entity.object3D) {
+        entity.object3D.visible = false;
+      }
+    }
+  }
+
+  private hasHit(side: 'left' | 'right'): boolean {
+    const entity = this.reticles[side];
+    return (
+      entity.hasComponent(EnvironmentRaycastTarget) &&
+      !!entity.getValue(EnvironmentRaycastTarget, 'xrHitTestResult')
     );
   }
 
@@ -221,15 +254,13 @@ export class SpikeSystem extends createSystem({
       return;
     }
 
+    this.refreshRays();
     const xr = this.input.xr;
     for (const side of ['left', 'right'] as const) {
       const select = xr.getSelectState(side);
       if (!select.start) continue;
       this.pinches += 1;
-      const reticle = this.reticles[side];
-      if (reticle.getValue(EnvironmentRaycastTarget, 'xrHitTestResult')) {
-        this.placeCube(reticle);
-      }
+      if (this.hasHit(side)) this.placeCube(this.reticles[side]);
     }
 
     const attached =
@@ -309,8 +340,8 @@ export class SpikeSystem extends createSystem({
       meshCount += 1;
       if (entity.getValue(XRMesh, 'semanticLabel') === 'table') tableMeshes += 1;
     }
-    const hitL = !!this.reticles.left.getValue(EnvironmentRaycastTarget, 'xrHitTestResult');
-    const hitR = !!this.reticles.right.getValue(EnvironmentRaycastTarget, 'xrHitTestResult');
+    const hitL = this.hasHit('left');
+    const hitR = this.hasHit('right');
 
     const mark = (ok: boolean) => (ok ? '✔' : '·');
     const lines = [

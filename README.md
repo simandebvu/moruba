@@ -16,7 +16,8 @@ npm run build
 
 - `src/engine/moruba.ts`: the rules, pure TypeScript (see `RULES.md` for the ruleset and sources)
 - `src/engine/search.ts`, `src/engine/ai.worker.ts`: alpha-beta AI, run in a Web Worker
-- `src/spike.ts`: device check scene (hands, table detection, pinch placement, persistent anchor)
+- `src/game/`: the mixed-reality game (board, seeds, hand input, placement on your table)
+- `src/spike.ts`: device check scene at `/?check` (hands, table detection, pinch placement, persistent anchor)
 
 ## Licence
 

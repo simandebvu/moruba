@@ -61,6 +61,15 @@ A hands-first mixed-reality version of **Moruba** (South Africa's Sepedi four-ro
 - Emulator loop: `npx @iwsdk/cli dev up` → `xr enter` → `xr set-input-mode --input-json '{"mode":"hand"}'` → `xr select --input-json '{"device":"hand-right"}'` → `browser screenshot --output-file …`.
 - AI timing on the Mac (classic board, no time limit): medium ~18 ms avg; hard ~280 ms avg, worst 5.9 s. Time limits cap it (hard 2.5 s), but Quest 2 is far slower: consider a transposition table before shipping Hard.
 
+## Status (day-2 slice built early, evening 11 Nov; emulator-verified only, not yet on a headset)
+- Public repo: https://github.com/simandebvu/moruba (this repo's git author is the GitHub no-reply address; keep the user's email out of committed files).
+- **Playable game** at the root URL: `src/game/` = `layout.ts` (board maths), `board-view.ts` (procedural board, instanced seeds, HUD + 4 buttons drawn on canvas textures), `game-system.ts` (turn flow, sow/capture animation from engine events, AI via worker, hover ring + count), `placement.ts` (board pose: restore from anchor, else in front of the player snapped to a table plane; "Move board" = follows the hit-test ray, pinch to set down), `sounds.ts` (synthesised placeholder clacks). The device-check scene is now at **`/?check`**.
+- Pits and buttons carry both `RayInteractable` (point + pinch, mouse in the browser) and `PokeInteractable` (fingertip touch). Press = lift, release = sow. Holding a pinch during sowing fast-forwards ×4 (buttons are ignored while seeds move).
+- **SDK gotcha (fixed in `placement.ts` and `spike.ts`):** `EnvironmentRaycastTarget` binds its hit-test source to the input source present when requested; after a controller↔hand switch it returns nothing. Remove and re-add the component when `input.xr.getPrimaryInputSource(side)` changes.
+- System method names `play`/`stop` are taken by the ECS base class; don't reuse them.
+- Emulator testing notes: screenshots are 800 px wide but the canvas is 1200 px (multiply click coordinates by 1.5); `xr list-targets` lists `pit-<player>-<index>` and `button-<action>`; press buttons with a run-sequence `press` step; aim a hand ray with `xr set-transform` + euler `orientation`.
+- Not done yet: Teach-me first game, wrist menu (HUD buttons stand in), virtual-table mode, art/audio pass, board scaling to the table, per-frame string building in `updateHud` (tidy before the perf pass).
+
 ## Immediate next steps (the list below was day 0; 1, 2 and the emulator half of 3 are done)
 1. Scaffold with `npm create @iwsdk@latest` (TS, AR, features above), pin `@iwsdk/core`, init git, create a public GitHub repo `simandebvu/moruba` (ask before creating), add an MIT license.
 2. Write the **rules engine** as pure TypeScript (no 3D) with thorough unit tests from RULES.md, then the AI worker.

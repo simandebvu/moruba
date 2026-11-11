@@ -30,6 +30,9 @@ export class PanelSystem extends createSystem({}) {
       () => exitButton.removeEventListener('click', exitXR),
       this.world.visibilityState.subscribe((visibilityState) => {
         const is2D = visibilityState === VisibilityState.NonImmersive;
+        // In mixed reality the panel would hang in the room behind the board.
+        const entity = this.world.getSceneEntity('welcome-panel');
+        if (entity?.object3D) entity.object3D.visible = is2D;
         xrButton.setProperties({ display: is2D ? 'flex' : 'none' });
         exitButton.setProperties({ display: is2D ? 'none' : 'flex' });
       }),
