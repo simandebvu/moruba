@@ -17,6 +17,7 @@ import {
   MeshStandardMaterial,
   SphereGeometry,
 } from '@iwsdk/core';
+import { woodTexture } from './textures.js';
 
 const TABLE_RADIUS = 0.6;
 const TABLE_THICKNESS = 0.035;
@@ -30,9 +31,14 @@ export class VirtualRoom {
   constructor() {
     this.group.name = 'virtual-room';
 
+    const tableTexture = woodTexture('#3d2413', 31);
+    tableTexture.repeat.set(2, 2);
+    // Grain runs across the table, left to right, as seen from the seat.
+    tableTexture.center.set(0.5, 0.5);
+    tableTexture.rotation = Math.PI / 2;
     const top = new Mesh(
       new CylinderGeometry(TABLE_RADIUS, TABLE_RADIUS - 0.02, TABLE_THICKNESS, 48),
-      new MeshStandardMaterial({ color: 0x3a2314, roughness: 0.6 }),
+      new MeshStandardMaterial({ map: tableTexture, color: 0xb8a898, roughness: 0.6 }),
     );
     top.position.y = -TABLE_THICKNESS / 2 - 0.0005;
     top.name = 'virtual-table-top';

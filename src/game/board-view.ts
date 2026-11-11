@@ -4,12 +4,14 @@
  */
 
 import {
+  BackSide,
   BoxGeometry,
   CanvasTexture,
   Color,
   CylinderGeometry,
   DoubleSide,
   ExtrudeGeometry,
+  Float32BufferAttribute,
   Group,
   InstancedMesh,
   Matrix4,
@@ -18,14 +20,17 @@ import {
   MeshStandardMaterial,
   Path,
   PlaneGeometry,
+  Quaternion,
   RingGeometry,
   Shape,
   SphereGeometry,
   SRGBColorSpace,
+  Vector3,
 } from '@iwsdk/core';
 import { loopSize, type Options, type Player } from '../engine/moruba.js';
 import {
   BASE_THICKNESS,
+  BOWL_SPHERE_RADIUS,
   boardSize,
   PIT_DEPTH,
   PIT_RADIUS,
@@ -33,7 +38,10 @@ import {
   SEED_RADIUS,
   SEED_SQUASH,
   TOP_Y,
+  TRAY_THICKNESS,
+  trayRect,
 } from './layout.js';
+import { boardTopTexture, shadowTexture, woodTexture } from './textures.js';
 
 export interface PitTarget {
   player: Player;
@@ -115,6 +123,9 @@ export class BoardView {
 
   private seeds: InstancedMesh;
   private matrix = new Matrix4();
+  private seedTurn: Quaternion[] = [];
+  private seedSize: Vector3[] = [];
+  private seedPosition = new Vector3();
   private highlight: Mesh;
   private label: TextPlane;
   private hud: TextPlane;
@@ -150,49 +161,169 @@ export class BoardView {
         shape.holes.push(hole);
       }
     }
+    const bevel = 0.0014;
     const plateGeometry = new ExtrudeGeometry(shape, {
-      depth: PIT_DEPTH,
-      bevelEnabled: false,
+      depth: PIT_DEPTH - 2 * bevel,
+      bevelEnabled: true,
+      bevelThickness: bevel,
+      bevelSize: bevel,
+      bevelOffset: -bevel,
+      bevelSegments: 2,
       curveSegments: 20,
     });
     plateGeometry.rotateX(-Math.PI / 2);
-    plateGeometry.translate(0, BASE_THICKNESS, 0);
-    const plateMaterial = new MeshStandardMaterial({
-      color: 0x9a6532,
-      roughness: 0.62,
-    });
-    const plate = new Mesh(plateGeometry, plateMaterial);
+    plateGeometry.translate(0, BASE_THICKNESS + bevel, 0);
+    const pits: { x: number; z: number }[] = [];
+    for (const player of [0, 1] as const) {
+      for (let i = 0; i < n; i++) {
+        const [x, , z] = pitCentre(options, player, i);
+        pits.push({ x, z });
+      }
+    }
+    const topTexture = boardTopTexture({ width, depth, pits, pitRadius: PIT_RADIUS });
+    const sideTexture = woodTexture('#8a5426', 11);
+    sideTexture.repeat.set(4, 4);
+    // Extrude groups: 0 = the flat faces (top and bottom), 1 = the sides.
+    const topMaterial = new MeshStandardMaterial({ map: topTexture, roughness: 0.58 });
+    const sideMaterial = new MeshStandardMaterial({ map: sideTexture, roughness: 0.62 });
+    const plate = new Mesh(plateGeometry, [topMaterial, sideMaterial]);
     plate.name = 'board-plate';
 
-    const baseGeometry = new BoxGeometry(width - 0.004, BASE_THICKNESS, depth - 0.004);
+    const baseGeometry = new BoxGeometry(width - 0.006, BASE_THICKNESS, depth - 0.006);
     baseGeometry.translate(0, BASE_THICKNESS / 2, 0);
     const baseMaterial = new MeshStandardMaterial({
-      color: 0x4b2d16,
+      color: 0x3f2512,
       roughness: 0.8,
     });
     const base = new Mesh(baseGeometry, baseMaterial);
     base.name = 'board-base';
     this.root.add(plate, base);
-    this.disposables.push(plateGeometry, plateMaterial, baseGeometry, baseMaterial);
+    this.disposables.push(
+      plateGeometry,
+      topTexture,
+      sideTexture,
+      topMaterial,
+      sideMaterial,
+      baseGeometry,
+      baseMaterial,
+    );
+
+    // Pits: bowls cut from a sphere, darker towards the bottom. One draw call.
+    const cap = Math.asin(PIT_RADIUS / BOWL_SPHERE_RADIUS);
+    const bowlGeometry = new SphereGeometry(
+      BOWL_SPHERE_RADIUS,
+      24,
+      6,
+      0,
+      Math.PI * 2,
+      Math.PI - cap,
+      cap,
+    );
+    bowlGeometry.translate(0, BASE_THICKNESS + BOWL_SPHERE_RADIUS, 0);
+    const bowlPosition = bowlGeometry.getAttribute('position');
+    const bowlColours: number[] = [];
+    for (let i = 0; i < bowlPosition.count; i++) {
+      const t = (bowlPosition.getY(i) - BASE_THICKNESS) / PIT_DEPTH; // 0 bottom, 1 rim
+      const shade = 0.42 + 0.58 * Math.min(1, Math.max(0, t));
+      bowlColours.push(shade, shade, shade);
+    }
+    bowlGeometry.setAttribute('color', new Float32BufferAttribute(bowlColours, 3));
+    const bowlMaterial = new MeshStandardMaterial({
+      color: 0x7a4a22,
+      roughness: 0.7,
+      vertexColors: true,
+      side: BackSide,
+    });
+    const bowls = new InstancedMesh(bowlGeometry, bowlMaterial, pits.length);
+    bowls.name = 'pit-bowls';
+    pits.forEach((pit, i) => {
+      this.matrix.makeTranslation(pit.x, 0, pit.z);
+      bowls.setMatrixAt(i, this.matrix);
+    });
+    this.root.add(bowls);
+    this.disposables.push(bowlGeometry, bowlMaterial, bowls);
 
     // A thin line across the middle separates the two players' halves.
-    const dividerGeometry = new BoxGeometry(width - 0.03, 0.0006, 0.0016);
-    const dividerMaterial = new MeshBasicMaterial({ color: 0x3a2110 });
+    const dividerGeometry = new BoxGeometry(width - 0.034, 0.0006, 0.0014);
+    const dividerMaterial = new MeshBasicMaterial({ color: 0x2e1606 });
     const divider = new Mesh(dividerGeometry, dividerMaterial);
     divider.position.y = TOP_Y + 0.0003;
     this.root.add(divider);
     this.disposables.push(dividerGeometry, dividerMaterial);
 
-    // Seeds: one instanced mesh, one draw call.
+    // Trays for captured seeds, one beside each player's right hand.
+    const trayTexture = woodTexture('#5a3418', 23, 256);
+    const trayMaterial = new MeshStandardMaterial({ map: trayTexture, roughness: 0.7 });
+    this.disposables.push(trayTexture, trayMaterial);
+    for (const player of [0, 1] as const) {
+      const rect = trayRect(options, player);
+      const trayShape = new Shape();
+      const tw = rect.width / 2;
+      const td = rect.depth / 2;
+      const tr = 0.008;
+      trayShape.moveTo(-tw + tr, -td);
+      trayShape.lineTo(tw - tr, -td);
+      trayShape.quadraticCurveTo(tw, -td, tw, -td + tr);
+      trayShape.lineTo(tw, td - tr);
+      trayShape.quadraticCurveTo(tw, td, tw - tr, td);
+      trayShape.lineTo(-tw + tr, td);
+      trayShape.quadraticCurveTo(-tw, td, -tw, td - tr);
+      trayShape.lineTo(-tw, -td + tr);
+      trayShape.quadraticCurveTo(-tw, -td, -tw + tr, -td);
+      const trayGeometry = new ExtrudeGeometry(trayShape, {
+        depth: TRAY_THICKNESS - 0.001,
+        bevelEnabled: true,
+        bevelThickness: 0.0005,
+        bevelSize: 0.001,
+        bevelSegments: 1,
+        curveSegments: 6,
+      });
+      trayGeometry.rotateX(-Math.PI / 2);
+      const tray = new Mesh(trayGeometry, trayMaterial);
+      tray.name = `tray-${player}`;
+      tray.position.set(rect.x, 0.0005, rect.z);
+      this.root.add(tray);
+      this.disposables.push(trayGeometry);
+    }
+    trayTexture.repeat.set(14, 14);
+
+    // Soft shadow so the board sits on the table instead of floating over it.
+    const shadowMap = shadowTexture();
+    const shadowGeometry = new PlaneGeometry(width + 0.2, depth + 0.1);
+    shadowGeometry.rotateX(-Math.PI / 2);
+    const shadowMaterial = new MeshBasicMaterial({
+      map: shadowMap,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+    });
+    const shadow = new Mesh(shadowGeometry, shadowMaterial);
+    shadow.name = 'board-shadow';
+    shadow.position.y = 0.0004;
+    shadow.renderOrder = -1;
+    this.root.add(shadow);
+    this.disposables.push(shadowMap, shadowGeometry, shadowMaterial);
+
+    // Seeds (morula pips): one instanced mesh, one draw call. Each pip keeps
+    // its own slight size and turn so a pit full of them looks natural.
     const seedGeometry = new SphereGeometry(SEED_RADIUS, 12, 8);
-    seedGeometry.scale(1, SEED_SQUASH, 1);
+    seedGeometry.scale(1, SEED_SQUASH, 0.82);
     const seedMaterial = new MeshStandardMaterial({
       color: 0xffffff,
-      roughness: 0.45,
+      roughness: 0.38,
     });
     this.seeds = new InstancedMesh(seedGeometry, seedMaterial, this.seedCount);
     this.seeds.name = 'seeds';
     this.seeds.frustumCulled = false;
+    const axis = new Vector3();
+    for (let i = 0; i < this.seedCount; i++) {
+      const a1 = ((i * 97) % 31) / 31;
+      const a2 = ((i * 57) % 23) / 23;
+      axis.set(a2 * 0.5 - 0.25, 1, a1 * 0.5 - 0.25).normalize();
+      this.seedTurn.push(new Quaternion().setFromAxisAngle(axis, a1 * Math.PI * 2));
+      const size = 0.92 + a2 * 0.16;
+      this.seedSize.push(new Vector3(size, size * (0.94 + a1 * 0.12), size));
+    }
     const tint = new Color();
     for (let i = 0; i < this.seedCount; i++) {
       // Morula-pip ivory with a little variation per seed.
@@ -331,7 +462,11 @@ export class BoardView {
   }
 
   setSeed(id: number, x: number, y: number, z: number): void {
-    this.matrix.makeTranslation(x, y, z);
+    this.matrix.compose(
+      this.seedPosition.set(x, y, z),
+      this.seedTurn[id],
+      this.seedSize[id],
+    );
     this.seeds.setMatrixAt(id, this.matrix);
   }
 

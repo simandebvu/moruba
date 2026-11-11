@@ -81,6 +81,11 @@ export class PlacementSystem extends createSystem({
   private cooldown = 0;
   private pendingRestore: SavedPose | null = null;
   private needsSave = false;
+  /** Set by the game: the virtual room is showing. */
+  virtual = false;
+  private virtualApplied = false;
+  private realPosition = new Vector3();
+  private realQuaternion = new Quaternion();
   private awaitingUuid = false;
   private raySources: Record<'left' | 'right', unknown> = {
     left: undefined,
@@ -166,6 +171,13 @@ export class PlacementSystem extends createSystem({
   /** Let the player set the board down somewhere else (XR only). */
   startPlacing(): void {
     if (this.mode !== 'placed') return;
+    if (this.virtualApplied) {
+      // Nothing real to point at in the virtual room: bring the table back
+      // in front of the player instead.
+      this.placeInFront(false);
+      this.cooldown = 0.4;
+      return;
+    }
     this.setMode('placing');
   }
 
@@ -176,6 +188,7 @@ export class PlacementSystem extends createSystem({
 
   private enterXR(): void {
     this.setMode('settling');
+    this.virtualApplied = false;
     this.root.visible = false;
     this.pendingRestore = null;
     const raw = readStorage(POSE_KEY);
@@ -193,6 +206,7 @@ export class PlacementSystem extends createSystem({
 
   private leaveXR(): void {
     this.setMode('browser');
+    this.virtualApplied = false;
     if (this.rootEntity.hasComponent(XRAnchor)) {
       this.rootEntity.removeComponent(XRAnchor);
     }
@@ -232,7 +246,7 @@ export class PlacementSystem extends createSystem({
   }
 
   /** In front of the seated player, on a detected table if there is one. */
-  private placeInFront(): void {
+  private placeInFront(snapToTable = true): void {
     const head = this.player.head;
     head.getWorldPosition(this.headPos);
     head.getWorldDirection(this.headDir); // points backwards (+Z of the head)
@@ -245,7 +259,7 @@ export class PlacementSystem extends createSystem({
     let y = Math.min(1.25, Math.max(0.3, this.headPos.y - 0.45));
     let onTable = false;
     let best = Infinity;
-    for (const entity of this.queries.planes.entities) {
+    for (const entity of snapToTable ? this.queries.planes.entities : []) {
       const plane = entity.getValue(XRPlane, '_plane') as
         | { orientation?: string }
         | undefined;
@@ -348,7 +362,26 @@ export class PlacementSystem extends createSystem({
       if (object && !showReticles) object.visible = false;
     }
 
-    if (this.mode === 'placed' && this.anchorAttached) {
+    // Virtual room: the board leaves its real-room spot for a comfortable
+    // table height in front of the player, and goes back when the room is
+    // switched off. The real-room pose is what stays saved.
+    if (this.mode === 'placed') {
+      if (this.virtual && !this.virtualApplied) {
+        if (this.needsSave && this.anchorAttached) this.save();
+        this.realPosition.copy(this.root.position);
+        this.realQuaternion.copy(this.root.quaternion);
+        this.placeInFront(false);
+        this.virtualApplied = true;
+        this.cooldown = 0.3;
+      } else if (!this.virtual && this.virtualApplied) {
+        this.root.position.copy(this.realPosition);
+        this.root.quaternion.copy(this.realQuaternion);
+        this.virtualApplied = false;
+        this.cooldown = 0.3;
+      }
+    }
+
+    if (this.mode === 'placed' && this.anchorAttached && !this.virtualApplied) {
       this.uuidPoll += delta;
       if (this.needsSave) {
         this.save();

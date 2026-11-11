@@ -19,7 +19,37 @@ export const SEED_SQUASH = 0.72;
 /** Height above the board at which lifted seeds travel. */
 export const CARRY_HEIGHT = 0.055;
 
+/** Thickness of the trays that hold captured seeds. */
+export const TRAY_THICKNESS = 0.004;
+/** Radius of the sphere the pit bowls are cut from. */
+export const BOWL_SPHERE_RADIUS =
+  (PIT_RADIUS * PIT_RADIUS + PIT_DEPTH * PIT_DEPTH) / (2 * PIT_DEPTH);
+
 export type Vec3 = [number, number, number];
+
+/** Height of the bowl surface above the pit's lowest point, at radius r from its centre. */
+export function bowlHeight(r: number): number {
+  const R = BOWL_SPHERE_RADIUS;
+  return R - Math.sqrt(Math.max(0, R * R - r * r));
+}
+
+/** Centre and size of a player's tray for captured seeds, beside the board on their right. */
+export function trayRect(
+  options: Options,
+  player: Player,
+): { x: number; z: number; width: number; depth: number } {
+  const { width } = boardSize(options);
+  const sign = player === 0 ? 1 : -1;
+  const spacing = SEED_RADIUS * 2.3;
+  const trayWidth = 2 * spacing + SEED_RADIUS * 2 + 0.012;
+  const trayDepth = 6 * spacing + SEED_RADIUS * 2 + 0.012;
+  return {
+    x: sign * (width / 2 + 0.022 + spacing),
+    z: sign * (0.012 + 3 * spacing),
+    width: trayWidth,
+    depth: trayDepth,
+  };
+}
 
 export function boardSize(options: Options): { width: number; depth: number } {
   return {
@@ -45,7 +75,8 @@ export function seedSlot(k: number): Vec3 {
   if (j === 0) return [0, y, 0];
   const angle = ((j - 1) * Math.PI) / 3 + layer * 0.5;
   const r = PIT_RADIUS * 0.56;
-  return [Math.cos(angle) * r, y, Math.sin(angle) * r];
+  // The pit is a bowl: seeds away from the middle sit a little higher.
+  return [Math.cos(angle) * r, y + bowlHeight(r), Math.sin(angle) * r];
 }
 
 /** Resting place of the k-th captured seed in a player's store, beside the board on their right. */
@@ -61,6 +92,6 @@ export function storeSlot(options: Options, player: Player, k: number): Vec3 {
   const spacing = SEED_RADIUS * 2.3;
   const x = width / 2 + 0.022 + cx * spacing;
   const z = 0.012 + cz * spacing;
-  const y = SEED_RADIUS * SEED_SQUASH + layer * SEED_RADIUS * 1.3;
+  const y = TRAY_THICKNESS + SEED_RADIUS * SEED_SQUASH + layer * SEED_RADIUS * 1.3;
   return [sign * x, y, sign * z];
 }

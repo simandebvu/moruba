@@ -266,7 +266,7 @@ export class GameSystem extends createSystem({
           button.setLabel(this.virtualRoom ? 'Room: virtual' : 'Room: yours');
           break;
         case 'move':
-          button.setLabel('Move board');
+          button.setLabel(this.virtualRoom ? 'Re-centre' : 'Move board');
           break;
       }
     }
@@ -737,6 +737,7 @@ export class GameSystem extends createSystem({
 
   update(delta: number): void {
     // The virtual room always shows in the browser; in the headset it is a choice.
+    this.placement.virtual = this.virtualRoom;
     const showRoom = this.virtualRoom || !this.placement.inXR;
     this.room.group.visible = showRoom;
     if (showRoom) {
