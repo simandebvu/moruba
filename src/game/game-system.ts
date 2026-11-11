@@ -68,7 +68,7 @@ const LEVELS: Level[] = ['easy', 'medium', 'hard'];
 const GREEN = 0x9be28a;
 const TAUGHT_KEY = 'moruba_taught';
 const ROOM_KEY = 'moruba_room';
-const LESSON_KEY = 'moruba_lesson';
+const LESSON_KEY = 'moruba_lesson_done';
 
 function readFlag(key: string): string | null {
   try {
@@ -160,6 +160,9 @@ export class GameSystem extends createSystem({
   private readSince = 0;
   /** A mouse press arrived this frame (the browser's "pinch anywhere"). */
   private tapped = false;
+  /** Dev notes: the last phase reported, and when the AI was asked. */
+  private reportedPhase = '';
+  private askedAt = 0;
 
   init(): void {
     this.placement = this.world.getSystem(PlacementSystem)!;
@@ -711,6 +714,7 @@ export class GameSystem extends createSystem({
     }
     this.phase = 'thinking';
     this.thinkStarted = this.clock;
+    this.askedAt = performance.now();
     this.requestId += 1;
     const request: AiRequest = {
       id: this.requestId,
@@ -736,6 +740,7 @@ export class GameSystem extends createSystem({
       this.nextTurn();
       return;
     }
+    report('ai-answer', { ms: Math.round(performance.now() - this.askedAt), worker: this.worker !== null });
     // Held until the "thinking" beat has been on screen long enough to read.
     this.aiMove = move;
   }
@@ -885,6 +890,11 @@ export class GameSystem extends createSystem({
       if (tap && this.clock - this.readSince > 0.8) this.lessonNext();
     }
     this.tapped = false;
+
+    if (this.phase !== this.reportedPhase) {
+      this.reportedPhase = this.phase;
+      report('phase', { phase: this.phase, lesson: this.lesson });
+    }
 
     this.updateHover();
     this.updateHud();

@@ -124,6 +124,7 @@ export class PlacementSystem extends createSystem({
     this.cleanupFuncs.push(
       this.world.visibilityState.subscribe((state) => {
         const xr = state !== VisibilityState.NonImmersive;
+        report('visibility', { state: String(state) });
         if (xr && this.mode === 'browser') this.enterXR();
         else if (!xr && this.mode !== 'browser') this.leaveXR();
       }),
@@ -381,18 +382,21 @@ export class PlacementSystem extends createSystem({
         this.setWorldPose(this.follow);
         break;
       }
+      // Not in the first moments: a pinch left over from pressing "Move board"
+      // or from entering must not drop the board somewhere by accident.
       if (
-        this.modeTime > 1 &&
+        this.modeTime > 2 &&
         (xr.getSelectState('left').start || xr.getSelectState('right').start)
       ) {
         this.note = this.following ? 'where you put it' : 'in front of you';
         this.needsSave = true;
+        // Long enough to take the hand off the board before pits respond.
+        this.cooldown = 1.2;
         this.root.getWorldPosition(this.tmp);
         report('board-set-down', {
           note: this.note,
           board: [this.tmp.x, this.tmp.y, this.tmp.z].map((n) => Math.round(n * 100) / 100),
         });
-        this.cooldown = 0.5;
         this.setMode('placed');
       }
     }
