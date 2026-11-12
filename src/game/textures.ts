@@ -178,3 +178,21 @@ export function shadowTexture(): CanvasTexture {
   texture.colorSpace = SRGBColorSpace;
   return texture;
 }
+
+/** A small round soft shadow for under a seed. */
+export function blobShadowTexture(): CanvasTexture {
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const gradient = ctx.createRadialGradient(32, 32, 4, 32, 32, 30);
+  gradient.addColorStop(0, 'rgba(20, 8, 0, 0.9)');
+  gradient.addColorStop(0.5, 'rgba(20, 8, 0, 0.45)');
+  gradient.addColorStop(1, 'rgba(20, 8, 0, 0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  const texture = new CanvasTexture(canvas);
+  texture.colorSpace = SRGBColorSpace;
+  return texture;
+}

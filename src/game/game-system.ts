@@ -707,6 +707,7 @@ export class GameSystem extends createSystem({
     this.pos[id * 3] = p[0];
     this.pos[id * 3 + 1] = p[1];
     this.pos[id * 3 + 2] = p[2];
+    this.view.setSeedFloor(id, p[1]);
     this.view.setSeed(id, p[0], p[1], p[2]);
   }
 
@@ -718,6 +719,7 @@ export class GameSystem extends createSystem({
     this.to[i] = target[0];
     this.to[i + 1] = target[1];
     this.to[i + 2] = target[2];
+    this.view.setSeedFloor(id, target[1]);
     this.t0[id] = this.clock;
     this.dur[id] = duration;
     this.arc[id] = arc;
@@ -1097,7 +1099,8 @@ export class GameSystem extends createSystem({
     for (const pit of legalPits(want)) {
       const gain = this.gains[pit] > 0 ? `+${this.gains[pit]}` : '';
       const risky = this.risks[pit] >= safest + 3;
-      this.labels[pit] = gain && risky ? `${gain} !` : gain || (risky ? '!' : '');
+      // A warning only ever rides on a capture: "this one is a trap".
+      this.labels[pit] = gain && risky ? `${gain} !` : gain;
     }
     this.view.showGains(this.labels);
     this.view.showThreats(null);

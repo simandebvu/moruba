@@ -42,7 +42,7 @@ import {
   TRAY_THICKNESS,
   trayRect,
 } from './layout.js';
-import { boardTopTexture, shadowTexture, woodTexture } from './textures.js';
+import { blobShadowTexture, boardTopTexture, shadowTexture, woodTexture } from './textures.js';
 
 export interface PitTarget {
   player: Player;
@@ -107,11 +107,32 @@ class TextPlane {
 
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 
-function panel(ctx: CanvasRenderingContext2D, w: number, h: number, fill: string) {
+/** Overlay colours: cream plaques lettered in dark brown, to sit with the carved board. */
+const CREAM = 'rgba(240, 225, 192, 0.97)';
+const INK = '#3a2410';
+const SIENNA = '#8f3a10';
+const LEAF = '#2f6a22';
+
+/** A rounded plaque; `line` (a CSS colour) adds a thin carved border just inside the edge. */
+function panel(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  fill: string,
+  line = '',
+  radius = Math.min(h * 0.22, w * 0.5),
+) {
   ctx.fillStyle = fill;
   ctx.beginPath();
-  ctx.roundRect(0, 0, w, h, h * 0.22);
+  ctx.roundRect(0, 0, w, h, radius);
   ctx.fill();
+  if (!line) return;
+  const inset = Math.max(3, Math.min(w, h) * 0.06);
+  ctx.strokeStyle = line;
+  ctx.lineWidth = Math.max(1.5, Math.min(w, h) * 0.018);
+  ctx.beginPath();
+  ctx.roundRect(inset, inset, w - 2 * inset, h - 2 * inset, Math.max(1, radius - inset));
+  ctx.stroke();
 }
 
 export class BoardView {
@@ -140,6 +161,8 @@ export class BoardView {
   private label: TextPlane;
   private hud: TextPlane;
   private lesson: TextPlane;
+  private seedShadows!: InstancedMesh;
+  private seedFloor: number[] = [];
   private handle: TextPlane;
   /** Centre of the grab handle along the board's depth (board space). */
   readonly handleZ: number;
@@ -256,7 +279,8 @@ export class BoardView {
     const bowlColours: number[] = [];
     for (let i = 0; i < bowlPosition.count; i++) {
       const t = (bowlPosition.getY(i) - BASE_THICKNESS) / PIT_DEPTH; // 0 bottom, 1 rim
-      const shade = 0.42 + 0.58 * Math.min(1, Math.max(0, t));
+      // Dark at the bottom and quickly lighter towards the rim, so it reads as a hollow.
+      const shade = 0.2 + 0.8 * Math.min(1, Math.max(0, t)) ** 1.6;
       bowlColours.push(shade, shade, shade);
     }
     bowlGeometry.setAttribute('color', new Float32BufferAttribute(bowlColours, 3));
@@ -342,7 +366,8 @@ export class BoardView {
     seedGeometry.scale(1, SEED_SQUASH, 0.82);
     const seedMaterial = new MeshStandardMaterial({
       color: 0xffffff,
-      roughness: 0.38,
+      roughness: 0.28,
+      metalness: 0.05,
     });
     this.seeds = new InstancedMesh(seedGeometry, seedMaterial, this.seedCount);
     this.seeds.name = 'seeds';
@@ -353,16 +378,37 @@ export class BoardView {
       const a2 = ((i * 57) % 23) / 23;
       axis.set(a2 * 0.5 - 0.25, 1, a1 * 0.5 - 0.25).normalize();
       this.seedTurn.push(new Quaternion().setFromAxisAngle(axis, a1 * Math.PI * 2));
-      const size = 0.92 + a2 * 0.16;
-      this.seedSize.push(new Vector3(size, size * (0.94 + a1 * 0.12), size));
+      const size = 0.9 + a2 * 0.2;
+      this.seedSize.push(new Vector3(size, size * (0.9 + a1 * 0.2), size * (0.94 + a2 * 0.12)));
     }
+    // River stones: warm greys and browns, no two quite alike.
+    const stones = [0xb9ab97, 0x8e7f6c, 0xd6c9b2, 0x6f5d4b, 0xa58a68, 0xc7b08a, 0x7d7468, 0x9c6f4a];
     const tint = new Color();
     for (let i = 0; i < this.seedCount; i++) {
-      // Morula-pip ivory with a little variation per seed.
       const v = ((i * 37) % 11) / 11;
-      tint.setRGB(0.93 - v * 0.1, 0.86 - v * 0.12, 0.7 - v * 0.14);
+      tint.setHex(stones[(i * 5 + ((i * 7) % 3)) % stones.length]);
+      tint.multiplyScalar(0.9 + v * 0.2);
       this.seeds.setColorAt(i, tint);
     }
+    // A small soft shadow under each stone at rest (one more draw call).
+    const blobTexture = blobShadowTexture();
+    const blobGeometry = new PlaneGeometry(SEED_RADIUS * 3, SEED_RADIUS * 3);
+    blobGeometry.rotateX(-Math.PI / 2);
+    const blobMaterial = new MeshBasicMaterial({
+      map: blobTexture,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
+    });
+    this.seedShadows = new InstancedMesh(blobGeometry, blobMaterial, this.seedCount);
+    this.seedShadows.name = 'seed-shadows';
+    this.seedShadows.frustumCulled = false;
+    this.seedFloor = new Array<number>(this.seedCount).fill(0);
+    this.root.add(this.seedShadows);
+    this.disposables.push(blobTexture, blobGeometry, blobMaterial);
     this.root.add(this.seeds);
     this.disposables.push(seedGeometry, seedMaterial);
 
@@ -442,11 +488,16 @@ export class BoardView {
     }
 
     this.label = new TextPlane(0.034, 0.034, 4000, (ctx, w, h, text) => {
-      ctx.fillStyle = 'rgba(24, 16, 10, 0.9)';
+      ctx.fillStyle = CREAM;
       ctx.beginPath();
       ctx.arc(w / 2, h / 2, w / 2, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = '#fff3d6';
+      ctx.strokeStyle = SIENNA;
+      ctx.lineWidth = w * 0.05;
+      ctx.beginPath();
+      ctx.arc(w / 2, h / 2, w * 0.44, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = INK;
       ctx.font = `bold ${Math.round(h * 0.6)}px ${FONT}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -459,33 +510,33 @@ export class BoardView {
     this.texts.push(this.label);
 
     // Heads-up panel on the far side, leaning back towards the player.
-    const hudWidth = Math.min(0.4, width);
-    const hudHeight = 0.092;
+    const hudWidth = Math.min(0.36, width);
+    const hudHeight = 0.078;
     this.hud = new TextPlane(hudWidth, hudHeight, 2600, (ctx, w, h, text) => {
-      panel(ctx, w, h, 'rgba(24, 16, 10, 0.88)');
+      panel(ctx, w, h, CREAM, SIENNA);
       const [line1, line2 = '', tip = ''] = text.split('\n');
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = '#ffd23a';
+      ctx.fillStyle = SIENNA;
       const alone = !line2 && !tip;
       ctx.font = `bold ${Math.round(h * (alone ? 0.3 : 0.22))}px ${FONT}`;
-      ctx.fillText(line1, w / 2, h * (alone ? 0.52 : tip ? 0.2 : 0.32), w * 0.94);
-      ctx.fillStyle = '#f3ead9';
+      ctx.fillText(line1, w / 2, h * (alone ? 0.52 : tip ? 0.22 : 0.34), w * 0.9);
+      ctx.fillStyle = INK;
       ctx.font = `${Math.round(h * 0.15)}px ${FONT}`;
-      ctx.fillText(line2, w / 2, h * (tip ? 0.45 : 0.68), w * 0.94);
+      ctx.fillText(line2, w / 2, h * (tip ? 0.45 : 0.68), w * 0.9);
       if (tip) {
         // Wrap the tip over at most two lines.
-        ctx.fillStyle = '#bfe6a8';
-        ctx.font = `${Math.round(h * 0.135)}px ${FONT}`;
+        ctx.fillStyle = LEAF;
+        ctx.font = `bold ${Math.round(h * 0.145)}px ${FONT}`;
         const words = tip.split(' ');
         const lines: string[] = [''];
         for (const word of words) {
           const trial = lines[lines.length - 1] ? `${lines[lines.length - 1]} ${word}` : word;
-          if (ctx.measureText(trial).width > w * 0.92 && lines.length < 2) lines.push(word);
+          if (ctx.measureText(trial).width > w * 0.88 && lines.length < 2) lines.push(word);
           else lines[lines.length - 1] = trial;
         }
         lines.forEach((line, k) =>
-          ctx.fillText(line, w / 2, h * (0.68 + k * 0.17), w * 0.94),
+          ctx.fillText(line, w / 2, h * (0.64 + k * 0.17), w * 0.9),
         );
       }
     });
@@ -502,12 +553,12 @@ export class BoardView {
     const rows = Math.ceil(actions.length / perRow);
     actions.forEach((action, i) => {
       const text = new TextPlane(buttonWidth, buttonHeight, 2600, (ctx, w, h, label) => {
-        panel(ctx, w, h, 'rgba(92, 56, 24, 0.95)');
+        panel(ctx, w, h, 'rgba(84, 50, 22, 0.97)', 'rgba(240, 225, 192, 0.55)');
         ctx.fillStyle = '#fff3d6';
         ctx.font = `bold ${Math.round(h * 0.46)}px ${FONT}`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(label, w / 2, h / 2 + h * 0.03, w * 0.9);
+        ctx.fillText(label, w / 2, h / 2 + h * 0.03, w * 0.84);
       });
       const row = Math.floor(i / perRow);
       text.mesh.name = `button-${action}`;
@@ -563,21 +614,35 @@ export class BoardView {
     // Badges over the human's playable pits: what the move takes ("+5", gold)
     // and a red "!" when it is clearly riskier than the safest move.
     for (let i = 0; i < n; i++) {
-      const badge = new TextPlane(0.04, 0.02, 3200, (ctx, w, h, text) => {
-        panel(ctx, w, h, 'rgba(24, 16, 10, 0.92)');
-        const parts = text.split(' ');
-        ctx.font = `bold ${Math.round(h * (parts.length > 1 ? 0.6 : 0.74))}px ${FONT}`;
+      const badge = new TextPlane(0.03, 0.013, 5200, (ctx, w, h, text) => {
+        const [gain, warn] = text.split(' ');
+        // A gold token for what the move takes; a red stud after it for a trap.
+        const tokenWidth = warn ? w - h * 1.1 : w;
+        ctx.save();
+        panel(ctx, tokenWidth, h, '#f2bd2c', 'rgba(58, 36, 16, 0.55)', h / 2);
+        ctx.fillStyle = INK;
+        ctx.font = `bold ${Math.round(h * 0.78)}px ${FONT}`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        parts.forEach((part, k) => {
-          ctx.fillStyle = part[0] === '+' ? '#ffd23a' : '#ff7a55';
-          ctx.fillText(part, (w * (k + 0.5)) / parts.length, h * 0.55, (w * 0.9) / parts.length);
-        });
+        ctx.fillText(gain, tokenWidth / 2, h * 0.56, tokenWidth * 0.8);
+        ctx.restore();
+        if (warn) {
+          ctx.fillStyle = '#c2371a';
+          ctx.beginPath();
+          ctx.arc(w - h / 2, h / 2, h / 2, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#fff3d6';
+          ctx.font = `bold ${Math.round(h * 0.8)}px ${FONT}`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('!', w - h / 2, h * 0.56);
+        }
       });
       const [x, , z] = pitCentre(options, 0, i);
       badge.mesh.name = `pit-gain-${i}`;
-      badge.mesh.position.set(x, TOP_Y + 0.02, z + 0.014);
-      badge.mesh.rotation.set(-0.75, 0, 0);
+      // On the pit's near rim, leaning towards the player, clear of the seeds.
+      badge.mesh.position.set(x, TOP_Y + 0.007, z + PIT_RADIUS * 1.02);
+      badge.mesh.rotation.set(-0.95, 0, 0);
       badge.mesh.renderOrder = 9;
       badge.mesh.visible = false;
       this.root.add(badge.mesh);
@@ -650,14 +715,30 @@ export class BoardView {
     // A wide bar, well clear of the nearest pits so reaching for them never grabs it.
     this.handleZ = depth / 2 + 0.075;
     this.handle = new TextPlane(0.28, 0.04, 2600, (ctx, w, h, label) => {
-      panel(ctx, w, h, 'rgba(232, 201, 138, 0.96)');
-      ctx.fillStyle = '#3a2410';
+      if (!label.trim()) {
+        // At rest: a slim wooden grip with three notches.
+        const gw = w * 0.5;
+        const gh = h * 0.36;
+        ctx.save();
+        ctx.translate((w - gw) / 2, (h - gh) / 2);
+        panel(ctx, gw, gh, 'rgba(84, 50, 22, 0.97)', 'rgba(240, 225, 192, 0.5)', gh / 2);
+        ctx.fillStyle = 'rgba(240, 225, 192, 0.8)';
+        for (let k = -1; k <= 1; k++) {
+          ctx.beginPath();
+          ctx.arc(gw / 2 + k * gh * 0.9, gh / 2, gh * 0.14, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+        return;
+      }
+      panel(ctx, w, h, CREAM, SIENNA, h / 2);
+      ctx.fillStyle = INK;
       ctx.font = `bold ${Math.round(h * 0.44)}px ${FONT}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(label, w / 2, h / 2 + h * 0.03, w * 0.92);
+      ctx.fillText(label, w / 2, h / 2 + h * 0.03, w * 0.88);
     });
-    this.handle.set('Pinch here and hold to move the board');
+    this.handle.set(' ');
     this.handle.mesh.name = 'board-handle';
     this.handle.mesh.position.set(0, 0.006, this.handleZ);
     this.handle.mesh.rotation.x = -Math.PI / 2 + 0.45;
@@ -669,17 +750,17 @@ export class BoardView {
     const lessonHeight = 0.17;
     const lessonWidth = 0.42;
     this.lesson = new TextPlane(lessonWidth, lessonHeight, 2600, (ctx, w, h, text) => {
-      panel(ctx, w, h, 'rgba(24, 16, 10, 0.94)');
+      panel(ctx, w, h, CREAM, SIENNA, h * 0.12);
       const [step = '', title = '', body = '', todo = ''] = text.split('\n');
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = '#c9b89c';
+      ctx.fillStyle = '#7a6548';
       ctx.font = `${Math.round(h * 0.075)}px ${FONT}`;
-      ctx.fillText(step, w / 2, h * 0.09, w * 0.92);
-      ctx.fillStyle = '#ffd23a';
+      ctx.fillText(step, w / 2, h * 0.11, w * 0.9);
+      ctx.fillStyle = SIENNA;
       ctx.font = `bold ${Math.round(h * (todo ? 0.135 : 0.19))}px ${FONT}`;
       ctx.fillText(title, w / 2, h * (todo ? 0.235 : 0.36), w * 0.92);
-      ctx.fillStyle = '#f3ead9';
+      ctx.fillStyle = INK;
       ctx.font = `${Math.round(h * (todo ? 0.1 : 0.12))}px ${FONT}`;
       const lines: string[] = [''];
       for (const word of body.split(' ')) {
@@ -692,9 +773,9 @@ export class BoardView {
       lines.forEach((line, k) =>
         ctx.fillText(line, w / 2, h * (top + k * 0.112), w * 0.94),
       );
-      ctx.fillStyle = '#9be28a';
+      ctx.fillStyle = LEAF;
       ctx.font = `bold ${Math.round(h * 0.1)}px ${FONT}`;
-      ctx.fillText(todo, w / 2, h * 0.9, w * 0.94);
+      ctx.fillText(todo, w / 2, h * 0.88, w * 0.9);
     });
     this.lesson.mesh.name = 'lesson-card';
     this.lesson.mesh.visible = false;
@@ -713,10 +794,21 @@ export class BoardView {
       this.seedSize[id],
     );
     this.seeds.setMatrixAt(id, this.matrix);
+    // The shadow stays under a stone at rest and shrinks away as it lifts.
+    const lift = Math.max(0, y - this.seedFloor[id]);
+    const size = Math.max(0, 1 - lift / 0.02);
+    this.matrix.makeScale(size, 1, size).setPosition(x, y - SEED_RADIUS * SEED_SQUASH * 0.8, z);
+    this.seedShadows.setMatrixAt(id, this.matrix);
+  }
+
+  /** Where seed `id` rests (its height when not in the air), for its shadow. */
+  setSeedFloor(id: number, y: number): void {
+    this.seedFloor[id] = y;
   }
 
   commitSeeds(): void {
     this.seeds.instanceMatrix.needsUpdate = true;
+    this.seedShadows.instanceMatrix.needsUpdate = true;
   }
 
   /** Show (board-space position) or hide the dot for hand `i`; gold when over something. */
@@ -923,8 +1015,8 @@ export class BoardView {
         : state === 'held'
         ? 'Let go to set the board down'
         : state === 'near'
-          ? 'Pinch now and hold'
-          : 'Pinch here and hold to move the board',
+          ? 'Pinch and hold to move the board'
+          : ' ',
     );
   }
 
@@ -941,5 +1033,6 @@ export class BoardView {
     for (const d of this.disposables) d.dispose();
     for (const t of this.texts) t.dispose();
     this.seeds.dispose();
+    this.seedShadows.dispose();
   }
 }
