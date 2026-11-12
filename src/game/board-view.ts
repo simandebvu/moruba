@@ -488,8 +488,8 @@ export class BoardView {
     this.hudGroup.rotation.x = -0.5;
     this.root.add(this.hudGroup);
 
-    const actions = ['new', 'size', 'level', 'teach', 'room', 'move'];
-    const perRow = 3;
+    const actions = ['new', 'level', 'daily', 'teach', 'size', 'room', 'move'];
+    const perRow = 4;
     const gap = 0.006;
     const buttonHeight = 0.028;
     const buttonWidth = (hudWidth - gap * (perRow - 1)) / perRow;
@@ -746,10 +746,10 @@ export class BoardView {
   }
 
   /** Seeds each side has on the board; the bar slides to match. */
-  setScore(mine: number, theirs: number): void {
+  setScore(mine: number, theirs: number, name: string): void {
     const total = mine + theirs;
     this.shareTarget = total > 0 ? mine / total : 0.5;
-    this.scoreText?.set(`You ${mine}|Moruba ${theirs}`);
+    this.scoreText?.set(`You ${mine}|${name} ${theirs}`);
   }
 
   setScoreVisible(visible: boolean): void {

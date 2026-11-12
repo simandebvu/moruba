@@ -33,7 +33,9 @@ import {
 } from '../engine/moruba.js';
 import { searchLevel, type Level } from '../engine/search.js';
 import { BoardView } from './board-view.js';
+import { dailyPuzzle, dateKey, dayBefore } from './daily.js';
 import { GhostHand } from './ghost-hand.js';
+import { OPPONENTS } from './opponents.js';
 import { pinchPoint } from './hands.js';
 import { LESSON, LESSON_BONUS, LESSON_END, lessonState } from './lesson.js';
 import {
@@ -69,7 +71,10 @@ type Phase =
 
 const HUMAN: Player = 0;
 const AI: Player = 1;
-const LEVELS: Level[] = ['easy', 'medium', 'hard'];
+const RIVAL_KEY = 'moruba_rival';
+const BEATEN_KEY = 'moruba_beaten';
+const STREAK_KEY = 'moruba_streak';
+const DAILY_KEY = 'moruba_daily';
 const GREEN = 0x9be28a;
 const TAUGHT_KEY = 'moruba_taught';
 const ROOM_KEY = 'moruba_room';
@@ -119,7 +124,26 @@ export class GameSystem extends createSystem({
   private placement!: PlacementSystem;
   private sounds = new Sounds();
   private options: Options = CLASSIC;
-  private level: Level = 'medium';
+  private rival = Math.min(OPPONENTS.length - 1, Math.max(0, Number(readFlag(RIVAL_KEY) ?? 0) || 0));
+  private beaten = Number(readFlag(BEATEN_KEY) ?? 0) || 0;
+  private streak = Number(readFlag(STREAK_KEY) ?? 0) || 0;
+  private remark = '';
+  private advance = false;
+  /** Move of the day in progress: the answer, and what the player took (-1 = not played yet). */
+  private daily: { key: string; best: number; bestPit: number; got: number; days: number } | null = null;
+
+  private get level(): Level {
+    return OPPONENTS[this.rival].level;
+  }
+
+  private get rivalName(): string {
+    return OPPONENTS[this.rival].name;
+  }
+
+  private say(lines: string | readonly string[]): void {
+    const line = typeof lines === 'string' ? lines : lines[Math.floor(Math.random() * lines.length)];
+    this.remark = `${this.rivalName}: “${line}”`;
+  }
   private state: State = newGame(CLASSIC);
   private phase: Phase = 'human';
   private mover: Player = HUMAN;
@@ -339,13 +363,20 @@ export class GameSystem extends createSystem({
     for (const button of this.view.buttons) {
       switch (button.action) {
         case 'new':
-          button.setLabel(this.lesson >= 0 ? 'Skip lesson' : 'New game');
+          button.setLabel(
+            this.lesson >= 0 ? 'Skip lesson' : this.daily ? 'Back to game' : 'New game',
+          );
           break;
         case 'size':
-          button.setLabel(this.options.cols === 8 ? 'Board: classic' : 'Board: quick');
+          button.setLabel(this.options.cols === 8 ? 'Board: big' : 'Board: quick');
           break;
         case 'level':
-          button.setLabel(`Level: ${this.level}`);
+          button.setLabel(
+            `Vs ${this.rivalName}${this.beaten & (1 << this.rival) ? ' ★' : ''}`,
+          );
+          break;
+        case 'daily':
+          button.setLabel('Move of the day');
           break;
         case 'teach':
           button.setLabel(this.lesson >= 0 ? 'Start again' : 'How to play');
@@ -354,7 +385,7 @@ export class GameSystem extends createSystem({
           button.setLabel(this.virtualRoom ? 'Room: virtual' : 'Room: yours');
           break;
         case 'move':
-          button.setLabel('Bring board here');
+          button.setLabel('Bring board');
           break;
       }
     }
@@ -362,6 +393,16 @@ export class GameSystem extends createSystem({
 
   private startGame(): void {
     this.requestId += 1; // drop any AI answer still on its way
+    if (this.advance) {
+      // You beat them: the next game is against the next one up.
+      this.advance = false;
+      if (this.rival + 1 < OPPONENTS.length) {
+        this.rival += 1;
+        writeFlag(RIVAL_KEY, String(this.rival));
+      }
+    }
+    this.say(OPPONENTS[this.rival].intro);
+    this.updateButtons();
     this.state = newGame(this.options, HUMAN);
     this.steps = [];
     this.onScriptEnd = null;
@@ -386,7 +427,8 @@ export class GameSystem extends createSystem({
   // ---------------------------------------------------------------- lesson
 
   private startLesson(): void {
-    if (this.lesson < 0) this.lessonReturn = this.options;
+    if (this.lesson < 0 && !this.daily) this.lessonReturn = this.options;
+    this.daily = null;
     if (this.options !== QUICK) {
       this.options = QUICK;
       this.buildBoard();
@@ -434,6 +476,115 @@ export class GameSystem extends createSystem({
       this.readSince = this.clock;
     }
     this.sounds.step();
+  }
+
+  // ------------------------------------------------------- move of the day
+
+  private startDaily(): void {
+    const key = dateKey(new Date());
+    const puzzle = dailyPuzzle(key);
+    if (this.lesson < 0 && !this.daily) this.lessonReturn = this.options;
+    this.lesson = -1;
+    if (this.options !== QUICK) {
+      this.options = QUICK;
+      this.buildBoard();
+    }
+    const [doneKey = '', days = '0'] = (readFlag(DAILY_KEY) ?? '').split('|');
+    this.daily = {
+      key,
+      best: puzzle.best,
+      bestPit: puzzle.bestPit,
+      got: -1,
+      // Days solved in a row up to yesterday (or today, if already solved).
+      days: doneKey === key || doneKey === dayBefore(key) ? Number(days) || 0 : 0,
+    };
+    this.requestId += 1;
+    this.hintId += 1;
+    this.aiMove = null;
+    this.state = puzzle.state;
+    this.steps = [];
+    this.onScriptEnd = null;
+    this.scriptHighlight = null;
+    this.heldPit = -1;
+    this.clock = 0;
+    this.cursor = 0;
+    this.syncSeeds();
+    this.phase = 'human';
+    this.mover = HUMAN;
+    this.hintPit = -1;
+    this.updateButtons();
+    report('daily-start', { key, best: puzzle.best });
+  }
+
+  /** The one move has been played: show how it went. */
+  private dailyRead(): void {
+    const daily = this.daily;
+    if (!daily) return;
+    daily.got = this.state.captured[HUMAN];
+    this.phase = 'reading';
+    this.readSince = this.clock;
+    report('daily-done', { key: daily.key, got: daily.got, best: daily.best });
+    if (daily.got >= daily.best) {
+      const [doneKey = ''] = (readFlag(DAILY_KEY) ?? '').split('|');
+      if (doneKey !== daily.key) {
+        daily.days += 1;
+        writeFlag(DAILY_KEY, `${daily.key}|${daily.days}`);
+      }
+      this.sounds.gameOver();
+    } else {
+      this.sounds.deny();
+    }
+  }
+
+  private dailyNext(): void {
+    if (this.daily && this.daily.got < this.daily.best) this.startDaily();
+    else this.finishDaily();
+    this.sounds.step();
+  }
+
+  private finishDaily(): void {
+    this.daily = null;
+    const back = this.lessonReturn ?? this.options;
+    this.lessonReturn = null;
+    if (back !== this.options) {
+      this.options = back;
+      this.buildBoard();
+    }
+    this.startGame();
+    this.updateButtons();
+  }
+
+  private updateDailyCard(): void {
+    const daily = this.daily;
+    if (!daily) return;
+    const pinch = this.placement.inXR ? 'Pinch' : 'Click';
+    let body = 'You have one move. Take as many of their seeds as you can.';
+    let todo: string;
+    if (this.placement.placing) {
+      todo = 'Carry the board where you like, then let go';
+    } else if (this.phase === 'reading') {
+      if (daily.got >= daily.best) {
+        body = `The best move! You took ${daily.got} seeds. Solved ${daily.days} day${daily.days === 1 ? '' : 's'} in a row. A new one comes tomorrow.`;
+        todo = `${pinch} anywhere to go back to your game`;
+      } else {
+        body = `You took ${daily.got}. There is a move that takes ${daily.best}.`;
+        todo = `${pinch} anywhere to try again`;
+      }
+    } else if (this.phase === 'human') {
+      todo = `${pinch} one of your pits`;
+    } else if (this.phase === 'bonus') {
+      body = 'A capture! Now take one more of their pits: pick the fullest.';
+      todo = `${pinch} one of their pits`;
+    } else if (this.phase === 'held') {
+      todo = this.direct ? 'Sweep your hand over the gold ring' : 'Let go to sow';
+    } else {
+      todo = 'Watch the seeds…';
+    }
+    const text = `lesson\nMove of the day · ${daily.key}\nFind the biggest capture\n${body}\n${todo}`;
+    if (text !== this.hudText) {
+      this.hudText = text;
+      this.view.setLesson(text.slice(text.indexOf('\n') + 1));
+    }
   }
 
   private finishLesson(): void {
@@ -501,8 +652,8 @@ export class GameSystem extends createSystem({
       return 'Your last seed fell in an empty pit, so the move ends there.';
     }
     return captured
-      ? 'Moruba ended in its empty inner pit facing your seeds, so it captures. Keep your inner row guarded or empty.'
-      : 'Moruba plays the far two rows by the same rules.';
+      ? `${this.rivalName} ended in an empty inner pit facing your seeds, so it captures. Keep your inner row guarded or empty.`
+      : `${this.rivalName} plays the far two rows by the same rules.`;
   }
 
   /** Rebuild every seed's place from the engine state (start of game, or to repair a mismatch). */
@@ -824,12 +975,33 @@ export class GameSystem extends createSystem({
 
   private nextTurn(): void {
     this.ghost?.hide();
+    const captured = this.taken;
     this.resetMove();
     if (this.lesson >= 0) {
       this.lessonRead();
       return;
     }
-    if (outcome(this.state).over) {
+    if (this.daily) {
+      this.dailyRead();
+      return;
+    }
+    if (captured > 0) {
+      this.say(this.mover === AI ? OPPONENTS[this.rival].gloat : OPPONENTS[this.rival].rue);
+    }
+    const result = outcome(this.state);
+    if (result.over) {
+      if (result.winner === HUMAN) {
+        this.beaten |= 1 << this.rival;
+        this.streak += 1;
+        this.advance = this.rival + 1 < OPPONENTS.length;
+        this.say(OPPONENTS[this.rival].lost);
+        writeFlag(BEATEN_KEY, String(this.beaten));
+      } else if (result.winner === AI) {
+        this.streak = 0;
+        this.say(OPPONENTS[this.rival].won);
+      }
+      writeFlag(STREAK_KEY, String(this.streak));
+      this.updateButtons();
       this.phase = 'over';
       report('game-over', { outcome: outcome(this.state), pits: this.state.pits, moves: this.state.moveCount });
       this.sounds.gameOver();
@@ -889,7 +1061,7 @@ export class GameSystem extends createSystem({
    */
   private updateOutlook(): void {
     const want =
-      this.phase === 'human' && !this.placement.busy ? this.state : null;
+      this.phase === 'human' && !this.placement.busy && !this.daily ? this.state : null;
     if (want === this.outlookState) return;
     this.outlookState = want;
     if (!want) {
@@ -929,7 +1101,7 @@ export class GameSystem extends createSystem({
     const b = this.pitSeeds[AI];
     for (let i = 0; i < a.length; i++) mine += a[i].length;
     for (let i = 0; i < b.length; i++) theirs += b[i].length;
-    this.view.setScore(mine, theirs);
+    this.view.setScore(mine, theirs, this.rivalName);
   }
 
   private onAiMove(id: number, move: Move | null): void {
@@ -1224,6 +1396,8 @@ export class GameSystem extends createSystem({
       }
     }
     if (end >= 0 && end !== marks[0]?.pit) marks.splice(1, 0, { player: HUMAN, pit: end, colour: WHITE });
+    // The move of the day is to be worked out: show only where the next seed goes.
+    if (this.daily) marks.length = Math.min(marks.length, 1);
     this.view.showMarks(marks);
   }
 
@@ -1313,13 +1487,14 @@ export class GameSystem extends createSystem({
     if (this.placement.busy || this.phase === 'animating') return;
     // A button press is not "pinch anywhere to continue".
     this.readSince = this.clock;
-    if (this.lesson >= 0 && (action === 'size' || action === 'level')) {
+    if ((this.lesson >= 0 || this.daily) && (action === 'size' || action === 'level')) {
       this.sounds.deny();
       return;
     }
     switch (action) {
       case 'new':
         if (this.lesson >= 0) this.finishLesson();
+        else if (this.daily) this.finishDaily();
         else this.startGame();
         break;
       case 'size':
@@ -1328,8 +1503,13 @@ export class GameSystem extends createSystem({
         this.startGame();
         break;
       case 'level':
-        this.level = LEVELS[(LEVELS.indexOf(this.level) + 1) % LEVELS.length];
-        this.updateButtons();
+        this.rival = (this.rival + 1) % OPPONENTS.length;
+        this.advance = false;
+        writeFlag(RIVAL_KEY, String(this.rival));
+        this.startGame();
+        break;
+      case 'daily':
+        this.startDaily();
         break;
       case 'teach':
         // The lesson, then tips again through the next game.
@@ -1424,7 +1604,10 @@ export class GameSystem extends createSystem({
         const xr = this.input.xr;
         tap = xr.getSelectState('left').start || xr.getSelectState('right').start;
       }
-      if (tap && this.clock - this.readSince > 0.8) this.lessonNext();
+      if (tap && this.clock - this.readSince > 0.8) {
+        if (this.daily) this.dailyNext();
+        else this.lessonNext();
+      }
     }
     this.tapped = false;
 
@@ -1491,11 +1674,12 @@ export class GameSystem extends createSystem({
       shown = true;
       if (playable) preview = index;
     }
-    this.setPreview(preview);
+    // The move of the day is for the player to work out: no preview there.
+    this.setPreview(this.daily ? -1 : preview);
     if (!shown) {
       this.view.hideLabel();
       // Teach me and the lesson: ring the suggested pit while nothing else is pointed at.
-      const guide = this.teach || this.lesson >= 0;
+      const guide = (this.teach || this.lesson >= 0) && !this.daily;
       if (guide && !this.placement.busy && this.phase === 'human' && this.hintPit >= 0) {
         this.view.showHighlight(HUMAN, this.hintPit, GREEN);
       } else if (guide && !this.placement.busy && this.phase === 'bonus' && this.bestBonus() >= 0) {
@@ -1549,6 +1733,10 @@ export class GameSystem extends createSystem({
       this.updateLessonCard();
       return;
     }
+    if (this.daily) {
+      this.updateDailyCard();
+      return;
+    }
     if (this.hudText.startsWith('lesson\n')) this.view.setLesson(null);
     let line1: string;
     if (this.placement.placing) {
@@ -1568,13 +1756,13 @@ export class GameSystem extends createSystem({
           line1 =
             this.mover === HUMAN
               ? 'Sowing… hold a pinch to speed up'
-              : 'Moruba sows… hold a pinch to speed up';
+              : `${this.rivalName} sows… hold a pinch to speed up`;
           break;
         case 'bonus':
           line1 = 'Capture! Pinch any one of their pits to take it too';
           break;
         case 'thinking':
-          line1 = 'Moruba is thinking…';
+          line1 = `${this.rivalName} is thinking…`;
           break;
         case 'reading':
           line1 = '';
@@ -1586,14 +1774,18 @@ export class GameSystem extends createSystem({
             : o.winner === null
               ? 'A draw. Pinch New game'
               : o.winner === HUMAN
-                ? 'You win! Pinch New game'
-                : 'Moruba wins. Pinch New game';
+                ? this.advance
+                  ? `You beat ${this.rivalName}! Pinch New game to face ${OPPONENTS[this.rival + 1].name}`
+                  : `You beat ${this.rivalName}! Pinch New game`
+                : `${this.rivalName} wins. Pinch New game`;
           break;
         }
       }
     }
-    const line2 = `Captured: you ${this.state.captured[HUMAN]} · Moruba ${this.state.captured[AI]}`;
-    const text = `${line1}\n${line2}\n${this.teach || this.teachEnds ? this.tip : ''}`;
+    const line2 = `Captured: you ${this.state.captured[HUMAN]} · ${this.rivalName} ${this.state.captured[AI]}${
+      this.streak > 1 ? `   ·   ${this.streak} wins in a row` : ''
+    }`;
+    const text = `${line1}\n${line2}\n${this.teach || this.teachEnds ? this.tip : this.remark}`;
     if (text !== this.hudText) {
       this.hudText = text;
       this.view.setHud(text);
