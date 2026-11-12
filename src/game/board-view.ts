@@ -142,6 +142,7 @@ export class BoardView {
   private texts: TextPlane[] = [];
   private disposables: { dispose(): void }[] = [];
   private dots: Mesh[] = [];
+  private highlightPulse = false;
   private gains: TextPlane[] = [];
   private threats: Mesh[] = [];
   private threatMaterial: MeshBasicMaterial | null = null;
@@ -674,10 +675,10 @@ export class BoardView {
       ctx.font = `${Math.round(h * 0.075)}px ${FONT}`;
       ctx.fillText(step, w / 2, h * 0.09, w * 0.92);
       ctx.fillStyle = '#ffd23a';
-      ctx.font = `bold ${Math.round(h * 0.135)}px ${FONT}`;
-      ctx.fillText(title, w / 2, h * 0.235, w * 0.92);
+      ctx.font = `bold ${Math.round(h * (todo ? 0.135 : 0.19))}px ${FONT}`;
+      ctx.fillText(title, w / 2, h * (todo ? 0.235 : 0.36), w * 0.92);
       ctx.fillStyle = '#f3ead9';
-      ctx.font = `${Math.round(h * 0.1)}px ${FONT}`;
+      ctx.font = `${Math.round(h * (todo ? 0.1 : 0.12))}px ${FONT}`;
       const lines: string[] = [''];
       for (const word of body.split(' ')) {
         const last = lines[lines.length - 1];
@@ -685,7 +686,7 @@ export class BoardView {
         if (last && ctx.measureText(trial).width > w * 0.9 && lines.length < 4) lines.push(word);
         else lines[lines.length - 1] = trial;
       }
-      const top = 0.57 - (lines.length - 1) * 0.056;
+      const top = (todo ? 0.57 : 0.7) - (lines.length - 1) * 0.056;
       lines.forEach((line, k) =>
         ctx.fillText(line, w / 2, h * (top + k * 0.112), w * 0.94),
       );
@@ -723,7 +724,9 @@ export class BoardView {
     (dot.material as MeshBasicMaterial).color.setHex(over ? 0xffd27a : 0xffffff);
   }
 
-  showHighlight(player: Player, pit: number, colour: number): void {
+  showHighlight(player: Player, pit: number, colour: number, pulse = false): void {
+    this.highlightPulse = pulse;
+    if (!pulse) this.highlight.scale.setScalar(1);
     const [x, , z] = pitCentre(this.options, player, pit);
     this.highlight.position.set(x, TOP_Y + 0.0008, z);
     (this.highlight.material as MeshBasicMaterial).color.setHex(colour);
@@ -806,6 +809,9 @@ export class BoardView {
   /** Advance the capture flashes. */
   update(delta: number): void {
     this.time += delta;
+    if (this.highlightPulse) {
+      this.highlight.scale.setScalar(1.12 + 0.14 * Math.sin(this.time * 6));
+    }
     if (Math.abs(this.shareTarget - this.share) > 0.0005) {
       this.share += (this.shareTarget - this.share) * Math.min(1, delta * 4);
       this.layoutScore();
@@ -880,11 +886,13 @@ export class BoardView {
   }
 
   /** The handle swells while a hand is on it and says what letting go does. */
-  setHandle(state: 'hidden' | 'idle' | 'near' | 'held'): void {
+  setHandle(state: 'hidden' | 'idle' | 'near' | 'held' | 'resting'): void {
     this.handle.mesh.visible = state !== 'hidden';
     this.handle.mesh.scale.setScalar(state === 'idle' ? 1 : 1.12);
     this.handle.set(
-      state === 'held'
+      state === 'resting'
+        ? 'On your table · let go'
+        : state === 'held'
         ? 'Let go to set the board down'
         : state === 'near'
           ? 'Pinch now and hold'

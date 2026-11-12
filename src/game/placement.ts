@@ -94,6 +94,9 @@ export class PlacementSystem extends createSystem({
   /** While carried: where the board is, and its offset from the hand. */
   private follow = new Vector3();
   private dragOffset = new Vector3();
+  private probe = new Vector3();
+  /** While carried: the board is sitting on a real surface the headset detected. */
+  resting = false;
 
   private headPos = new Vector3();
   private headDir = new Vector3();
@@ -150,20 +153,78 @@ export class PlacementSystem extends createSystem({
   dragTo(hand: Vector3): void {
     if (this.mode !== 'placing') return;
     this.follow.copy(hand).add(this.dragOffset);
+    // Brought close to a real table top, the board settles onto it.
+    const surface = this.surfaceAt(this.follow, 0.07);
+    this.resting = surface !== null;
+    if (surface !== null) this.follow.y = surface;
     this.setWorldPose(this.follow);
   }
 
   endDrag(): void {
     if (this.mode !== 'placing') return;
-    this.note = 'where you put it';
+    this.note = this.resting ? 'on your table' : 'where you put it';
+    this.resting = false;
     if (!this.virtualApplied) this.needsSave = true;
     this.cooldown = 0.6;
     this.root.getWorldPosition(this.tmp);
     report('board-set-down', {
       note: this.note,
+      onSurface: this.note === 'on your table',
       board: [this.tmp.x, this.tmp.y, this.tmp.z].map((n) => Math.round(n * 100) / 100),
     });
     this.setMode('placed');
+  }
+
+  /**
+   * World height of a real horizontal surface (from the headset's scene data)
+   * lying under `point` and within `reach` metres above or below it; null if
+   * there is none. The floor does not count: only surfaces a seated player
+   * could play on, judged relative to the head because absolute heights are
+   * unreliable on headsets without a room scan.
+   */
+  private surfaceAt(point: Vector3, reach: number): number | null {
+    if (this.virtualApplied) return null;
+    this.player.head.getWorldPosition(this.headPos);
+    let found: number | null = null;
+    let best = reach;
+    for (const entity of this.queries.planes.entities) {
+      const plane = entity.getValue(XRPlane, '_plane') as
+        | {
+            orientation?: string;
+            semanticLabel?: string;
+            polygon?: ArrayLike<{ x: number; z: number }>;
+          }
+        | undefined;
+      const object = entity.object3D;
+      const polygon = plane?.polygon;
+      if (!object || !polygon || plane?.orientation?.toLowerCase() !== 'horizontal') continue;
+      const label = plane?.semanticLabel?.toLowerCase();
+      if (label === 'floor' || label === 'ceiling') continue;
+      object.worldToLocal(this.probe.copy(point));
+      const gap = Math.abs(this.probe.y);
+      if (gap >= best) continue;
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let minZ = Infinity;
+      let maxZ = -Infinity;
+      for (let i = 0; i < polygon.length; i++) {
+        const corner = polygon[i];
+        if (corner.x < minX) minX = corner.x;
+        if (corner.x > maxX) maxX = corner.x;
+        if (corner.z < minZ) minZ = corner.z;
+        if (corner.z > maxZ) maxZ = corner.z;
+      }
+      if (this.probe.x < minX || this.probe.x > maxX || this.probe.z < minZ || this.probe.z > maxZ) {
+        continue;
+      }
+      this.probe.y = 0;
+      object.localToWorld(this.probe);
+      const below = this.headPos.y - this.probe.y;
+      if (below < 0.15 || below > 1.4) continue;
+      best = gap;
+      found = this.probe.y;
+    }
+    return found;
   }
 
   private setMode(mode: Mode): void {
@@ -297,7 +358,15 @@ export class PlacementSystem extends createSystem({
     this.player.head.getWorldPosition(this.headPos);
     this.root.getWorldPosition(this.tmp);
     let planes = 0;
-    for (const _ of this.queries.planes.entities) planes += 1;
+    // Horizontal surfaces the headset knows about (where the board could rest).
+    const surfaces: number[][] = [];
+    for (const entity of this.queries.planes.entities) {
+      planes += 1;
+      const plane = entity.getValue(XRPlane, '_plane') as { orientation?: string } | undefined;
+      if (plane?.orientation?.toLowerCase() !== 'horizontal' || !entity.object3D) continue;
+      entity.object3D.getWorldPosition(this.probe);
+      if (surfaces.length < 12) surfaces.push(round(this.probe));
+    }
     report('game-status', {
       mode: this.mode,
       note: this.note,
@@ -308,6 +377,7 @@ export class PlacementSystem extends createSystem({
       anchorAttached: this.anchorAttached,
       savedPose: readStorage(POSE_KEY) !== null,
       planes,
+      surfaces,
       session: describeSession(this.xrManager.getSession()),
     });
   }

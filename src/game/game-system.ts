@@ -37,7 +37,7 @@ import { dailyPuzzle, dateKey, dayBefore } from './daily.js';
 import { GhostHand } from './ghost-hand.js';
 import { OPPONENTS } from './opponents.js';
 import { pinchPoint } from './hands.js';
-import { LESSON, LESSON_BONUS, LESSON_END, lessonState } from './lesson.js';
+import { LESSON, LESSON_BONUS, LESSON_SWEEP, lessonState } from './lesson.js';
 import {
   CARRY_HEIGHT,
   pitCentre,
@@ -200,7 +200,6 @@ export class GameSystem extends createSystem({
 
   // "How to play": -1 when off, else the stage (LESSON.length = closing card).
   private lesson = -1;
-  private lessonBody = '';
   /** Board size to go back to when the lesson ends. */
   private lessonReturn: Options | null = null;
   private readSince = 0;
@@ -454,7 +453,6 @@ export class GameSystem extends createSystem({
     this.phase = 'human';
     this.mover = HUMAN;
     this.hintPit = stage.pit;
-    this.lessonBody = stage.ask;
     report('lesson-stage', { stage: index });
   }
 
@@ -462,19 +460,11 @@ export class GameSystem extends createSystem({
   private lessonRead(): void {
     this.phase = 'reading';
     this.readSince = this.clock;
-    if (this.lesson < LESSON.length) this.lessonBody = LESSON[this.lesson].after;
   }
 
   private lessonNext(): void {
-    if (this.lesson >= LESSON.length) {
-      this.finishLesson();
-    } else if (this.lesson + 1 < LESSON.length) {
-      this.loadStage(this.lesson + 1);
-    } else {
-      this.lesson = LESSON.length;
-      this.lessonBody = LESSON_END.body;
-      this.readSince = this.clock;
-    }
+    if (this.lesson + 1 < LESSON.length) this.loadStage(this.lesson + 1);
+    else this.finishLesson();
     this.sounds.step();
   }
 
@@ -944,7 +934,6 @@ export class GameSystem extends createSystem({
     }
     if (player === HUMAN) {
       this.phase = 'bonus';
-      if (this.lesson >= 0) this.lessonBody = LESSON_BONUS;
       if (this.teach) {
         this.tip = 'A capture also wins you any one other pit of theirs. The green ring marks their fullest.';
       }
@@ -1041,6 +1030,7 @@ export class GameSystem extends createSystem({
   }
 
   private aiMove: Move | null = null;
+  private wasResting = false;
   /** This move so far: lifts, seeds dropped, seeds captured. */
   private chain = 0;
   private dropStep = 0;
@@ -1078,6 +1068,11 @@ export class GameSystem extends createSystem({
       for (const event of sow(want, pit).events) {
         if (event.type === 'capture') this.gains[pit] += event.seeds;
       }
+    }
+    if (this.lesson >= 0) {
+      // In the lesson only the pit being taught may shout.
+      const taught = LESSON[Math.min(this.lesson, LESSON.length - 1)].pit;
+      for (let i = 0; i < n; i++) if (i !== taught) this.gains[i] = 0;
     }
     this.view.showGains(this.gains);
     if (this.lesson >= 0) {
@@ -1332,8 +1327,18 @@ export class GameSystem extends createSystem({
       buttons[i].mesh.scale.setScalar(this.directHover === 1000 + i ? 1.12 : 1);
     }
     this.view.setHandle(
-      this.dragSide ? 'held' : this.directHover === HANDLE ? 'near' : 'idle',
+      this.dragSide
+        ? this.placement.resting
+          ? 'resting'
+          : 'held'
+        : this.directHover === HANDLE
+          ? 'near'
+          : 'idle',
     );
+    // A knock as the board touches down on a real surface.
+    const resting = this.dragSide !== null && this.placement.resting;
+    if (resting && !this.wasResting) this.sounds.clack(1);
+    this.wasResting = resting;
   }
 
   /** The human just lifted `heldPit` by hand: work out the move it starts. */
@@ -1604,9 +1609,12 @@ export class GameSystem extends createSystem({
         const xr = this.input.xr;
         tap = xr.getSelectState('left').start || xr.getSelectState('right').start;
       }
-      if (tap && this.clock - this.readSince > 0.8) {
-        if (this.daily) this.dailyNext();
-        else this.lessonNext();
+      const read = this.clock - this.readSince;
+      if (this.daily) {
+        if (tap && read > 0.8) this.dailyNext();
+      } else if ((tap && read > 0.8) || read > 3.2) {
+        // The lesson moves on by itself: nothing to read for long.
+        this.lessonNext();
       }
     }
     this.tapped = false;
@@ -1681,7 +1689,7 @@ export class GameSystem extends createSystem({
       // Teach me and the lesson: ring the suggested pit while nothing else is pointed at.
       const guide = (this.teach || this.lesson >= 0) && !this.daily;
       if (guide && !this.placement.busy && this.phase === 'human' && this.hintPit >= 0) {
-        this.view.showHighlight(HUMAN, this.hintPit, GREEN);
+        this.view.showHighlight(HUMAN, this.hintPit, GREEN, true);
       } else if (guide && !this.placement.busy && this.phase === 'bonus' && this.bestBonus() >= 0) {
         this.view.showHighlight(AI, this.bestBonus(), GREEN);
       } else {
@@ -1691,37 +1699,37 @@ export class GameSystem extends createSystem({
   }
 
   private updateLessonCard(): void {
-    const total = LESSON.length + 1;
-    const closing = this.lesson >= LESSON.length;
-    const pinch = this.placement.inXR ? 'Pinch' : 'Click';
-    let todo: string;
+    const stage = LESSON[Math.min(this.lesson, LESSON.length - 1)];
+    const mouse = !this.placement.inXR;
+    let ask = stage.ask;
+    let note = stage.askNote;
     if (this.placement.placing) {
-      todo = 'Carry the board where you like, then let go';
+      ask = 'Carry the board where you like';
+      note = 'Let go to set it down.';
     } else {
       switch (this.phase) {
         case 'human':
-          todo = `${pinch} the glowing pit`;
           break;
         case 'held':
-          todo = this.direct ? 'Sweep your hand over the gold ring' : 'Let go to sow';
-          break;
         case 'sowing':
-          todo = 'Follow the gold ring · or pinch to finish';
+          ask = this.direct ? LESSON_SWEEP.ask : 'Let go to sow';
+          note = LESSON_SWEEP.note;
           break;
         case 'bonus':
-          todo = `${pinch} one of their pits`;
+          ask = LESSON_BONUS.ask;
+          note = LESSON_BONUS.note;
           break;
         case 'reading':
-          todo = closing
-            ? `${pinch} anywhere to start a real game`
-            : `${pinch} anywhere to continue`;
+          ask = stage.after;
+          note = stage.afterNote;
           break;
         default:
-          todo = 'Watch the seeds…';
+          ask = 'Watch the seeds';
+          note = '';
       }
     }
-    const title = closing ? LESSON_END.title : LESSON[this.lesson].title;
-    const text = `lesson\nHow to play · ${Math.min(this.lesson + 1, total)} of ${total}\n${title}\n${this.lessonBody}\n${todo}`;
+    if (mouse) ask = ask.replace('Pinch', 'Click');
+    const text = `lesson\nHow to play · ${this.lesson + 1} of ${LESSON.length}\n${ask}\n${note}\n`;
     if (text !== this.hudText) {
       this.hudText = text;
       this.view.setLesson(text.slice(text.indexOf('\n') + 1));
