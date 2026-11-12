@@ -4,6 +4,7 @@
  */
 
 import {
+  AdditiveBlending,
   BackSide,
   BoxGeometry,
   CanvasTexture,
@@ -141,6 +142,22 @@ export class BoardView {
   private texts: TextPlane[] = [];
   private disposables: { dispose(): void }[] = [];
   private dots: Mesh[] = [];
+  private gains: TextPlane[] = [];
+  private threats: Mesh[] = [];
+  private threatMaterial: MeshBasicMaterial | null = null;
+  private popups: TextPlane[] = [];
+  private popupAge: number[] = [];
+  private popupBase: number[] = [];
+  private glow: Mesh | null = null;
+  private glowAge = -1;
+  private scoreGroup = new Group();
+  private scoreMine: Mesh | null = null;
+  private scoreTheirs: Mesh | null = null;
+  private scoreText: TextPlane | null = null;
+  private scoreWidth = 0.4;
+  private share = 0.5;
+  private shareTarget = 0.5;
+  private time = 0;
 
   constructor(readonly options: Options) {
     this.root.name = 'moruba-board';
@@ -509,6 +526,123 @@ export class BoardView {
     this.hudGroup.add(this.hud.mesh);
     this.texts.push(this.hud);
 
+    // Tug-of-war bar above the panel: whose seeds fill more of the board.
+    const barHeight = 0.016;
+    this.scoreWidth = hudWidth;
+    const barGeometry = new PlaneGeometry(1, barHeight);
+    const mineMaterial = new MeshBasicMaterial({ color: 0xffc23a });
+    const theirsMaterial = new MeshBasicMaterial({ color: 0xb8452a });
+    this.disposables.push(barGeometry, mineMaterial, theirsMaterial);
+    this.scoreMine = new Mesh(barGeometry, mineMaterial);
+    this.scoreTheirs = new Mesh(barGeometry, theirsMaterial);
+    this.scoreText = new TextPlane(hudWidth, barHeight, 2600, (ctx, w, h, text) => {
+      const [mine = '', theirs = ''] = text.split('|');
+      ctx.font = `bold ${Math.round(h * 0.72)}px ${FONT}`;
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#2a1608';
+      ctx.textAlign = 'left';
+      ctx.fillText(mine, h * 0.4, h * 0.54);
+      ctx.fillStyle = '#fff3d6';
+      ctx.textAlign = 'right';
+      ctx.fillText(theirs, w - h * 0.4, h * 0.54);
+      // Half-way mark.
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+      ctx.fillRect(w / 2 - 2, 0, 4, h);
+    });
+    this.scoreText.mesh.position.z = 0.0006;
+    this.texts.push(this.scoreText);
+    this.scoreGroup.name = 'score-bar';
+    this.scoreGroup.position.set(
+      0,
+      rows * (buttonHeight + gap) + hudHeight + 0.005 + barHeight / 2,
+      0,
+    );
+    this.scoreGroup.add(this.scoreMine, this.scoreTheirs, this.scoreText.mesh);
+    this.hudGroup.add(this.scoreGroup);
+    this.layoutScore();
+
+    // "+5" badges over the human's pits that would capture.
+    for (let i = 0; i < n; i++) {
+      const badge = new TextPlane(0.034, 0.02, 3200, (ctx, w, h, text) => {
+        panel(ctx, w, h, 'rgba(24, 16, 10, 0.92)');
+        ctx.fillStyle = '#ffd23a';
+        ctx.font = `bold ${Math.round(h * 0.74)}px ${FONT}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(text, w / 2, h * 0.55, w * 0.9);
+      });
+      const [x, , z] = pitCentre(options, 0, i);
+      badge.mesh.name = `pit-gain-${i}`;
+      badge.mesh.position.set(x, TOP_Y + 0.02, z + 0.014);
+      badge.mesh.rotation.set(-0.75, 0, 0);
+      badge.mesh.renderOrder = 9;
+      badge.mesh.visible = false;
+      this.root.add(badge.mesh);
+      this.gains.push(badge);
+      this.texts.push(badge);
+    }
+
+    // Red warning rings on the human's pits the opponent could take next.
+    this.threatMaterial = new MeshBasicMaterial({
+      color: 0xff5a3a,
+      transparent: true,
+      opacity: 0.8,
+      depthWrite: false,
+    });
+    this.disposables.push(this.threatMaterial);
+    for (let i = 0; i < n; i++) {
+      const ring = new Mesh(ringGeometry, this.threatMaterial);
+      const [x, , z] = pitCentre(options, 0, i);
+      ring.name = `pit-threat-${i}`;
+      ring.position.set(x, TOP_Y + 0.0005, z);
+      ring.scale.setScalar(1.1);
+      ring.visible = false;
+      this.root.add(ring);
+      this.threats.push(ring);
+    }
+
+    // Words that rise out of a pit and fade ("+4", "Chain ×2").
+    for (let i = 0; i < 4; i++) {
+      const popup = new TextPlane(0.1, 0.03, 2600, (ctx, w, h, text) => {
+        const [colour = '#ffd23a', words = ''] = text.split('|');
+        ctx.font = `bold ${Math.round(h * 0.8)}px ${FONT}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.lineWidth = h * 0.16;
+        ctx.strokeStyle = 'rgba(20, 12, 6, 0.95)';
+        ctx.strokeText(words, w / 2, h * 0.54, w * 0.94);
+        ctx.fillStyle = colour;
+        ctx.fillText(words, w / 2, h * 0.54, w * 0.94);
+      });
+      popup.mesh.name = `popup-${i}`;
+      popup.mesh.rotation.set(-0.75, 0, 0);
+      popup.mesh.renderOrder = 12;
+      popup.mesh.visible = false;
+      (popup.mesh.material as MeshBasicMaterial).depthTest = false;
+      this.root.add(popup.mesh);
+      this.popups.push(popup);
+      this.popupAge.push(-1);
+      this.popupBase.push(0);
+      this.texts.push(popup);
+    }
+
+    // A wash of light over the whole board for a big capture.
+    const glowGeometry = new PlaneGeometry(width, depth);
+    glowGeometry.rotateX(-Math.PI / 2);
+    const glowMaterial = new MeshBasicMaterial({
+      color: 0xffd23a,
+      transparent: true,
+      opacity: 0,
+      blending: AdditiveBlending,
+      depthWrite: false,
+    });
+    this.disposables.push(glowGeometry, glowMaterial);
+    this.glow = new Mesh(glowGeometry, glowMaterial);
+    this.glow.name = 'board-glow';
+    this.glow.position.y = TOP_Y + 0.003;
+    this.glow.visible = false;
+    this.root.add(this.glow);
+
     // Grab handle on the player's side: pinch and hold it to carry the board.
     // A wide bar, well clear of the nearest pits so reaching for them never grabs it.
     this.handleZ = depth / 2 + 0.075;
@@ -600,6 +734,64 @@ export class BoardView {
     this.highlight.visible = false;
   }
 
+  private layoutScore(): void {
+    const w = this.scoreWidth;
+    const mine = Math.max(0.001, this.share * w);
+    const theirs = Math.max(0.001, w - mine);
+    if (!this.scoreMine || !this.scoreTheirs) return;
+    this.scoreMine.scale.x = mine;
+    this.scoreMine.position.x = -w / 2 + mine / 2;
+    this.scoreTheirs.scale.x = theirs;
+    this.scoreTheirs.position.x = w / 2 - theirs / 2;
+  }
+
+  /** Seeds each side has on the board; the bar slides to match. */
+  setScore(mine: number, theirs: number): void {
+    const total = mine + theirs;
+    this.shareTarget = total > 0 ? mine / total : 0.5;
+    this.scoreText?.set(`You ${mine}|Moruba ${theirs}`);
+  }
+
+  setScoreVisible(visible: boolean): void {
+    this.scoreGroup.visible = visible;
+  }
+
+  /** "+n" over each of the human's pits that would capture n seeds (0 = nothing). */
+  showGains(gains: readonly number[] | null): void {
+    for (let i = 0; i < this.gains.length; i++) {
+      const gain = gains ? (gains[i] ?? 0) : 0;
+      this.gains[i].mesh.visible = gain > 0;
+      if (gain > 0) this.gains[i].set(`+${gain}`);
+    }
+  }
+
+  /** Warn on the human's pits the opponent could capture next turn. */
+  showThreats(pits: readonly boolean[] | null): void {
+    for (let i = 0; i < this.threats.length; i++) {
+      this.threats[i].visible = pits ? pits[i] === true : false;
+    }
+  }
+
+  /** Words rising out of a pit. `colour` is a CSS colour. */
+  popup(player: Player, pit: number, words: string, colour: string, big = false): void {
+    let slot = this.popupAge.indexOf(-1);
+    if (slot < 0) slot = 0;
+    const [x, , z] = pitCentre(this.options, player, pit);
+    const popup = this.popups[slot];
+    popup.set(`${colour}|${words}`);
+    popup.mesh.position.set(x, TOP_Y + 0.04, z);
+    popup.mesh.scale.setScalar(big ? 1.5 : 1);
+    this.popupBase[slot] = TOP_Y + 0.04;
+    this.popupAge[slot] = 0;
+  }
+
+  /** Light the whole board for a moment. */
+  burst(colour: number): void {
+    if (!this.glow) return;
+    (this.glow.material as MeshBasicMaterial).color.setHex(colour);
+    this.glowAge = 0;
+  }
+
   /** A ring bursting outwards from a pit: something was captured there. */
   flash(player: Player, pit: number, colour: number): void {
     let slot = this.flashAge.indexOf(-1);
@@ -613,6 +805,35 @@ export class BoardView {
 
   /** Advance the capture flashes. */
   update(delta: number): void {
+    this.time += delta;
+    if (Math.abs(this.shareTarget - this.share) > 0.0005) {
+      this.share += (this.shareTarget - this.share) * Math.min(1, delta * 4);
+      this.layoutScore();
+    }
+    if (this.threatMaterial) {
+      this.threatMaterial.opacity = 0.5 + 0.35 * Math.sin(this.time * 5);
+    }
+    for (let i = 0; i < this.popups.length; i++) {
+      if (this.popupAge[i] < 0) continue;
+      this.popupAge[i] += delta;
+      const t = this.popupAge[i] / 1.3;
+      const mesh = this.popups[i].mesh;
+      if (t >= 1) {
+        this.popupAge[i] = -1;
+        mesh.visible = false;
+        continue;
+      }
+      mesh.visible = true;
+      mesh.position.y = this.popupBase[i] + 0.05 * (1 - (1 - t) * (1 - t));
+      (mesh.material as MeshBasicMaterial).opacity = t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4;
+    }
+    if (this.glow && this.glowAge >= 0) {
+      this.glowAge += delta;
+      const t = this.glowAge / 0.7;
+      this.glow.visible = t < 1;
+      (this.glow.material as MeshBasicMaterial).opacity = t < 1 ? 0.45 * (1 - t) * (1 - t) : 0;
+      if (t >= 1) this.glowAge = -1;
+    }
     for (let i = 0; i < this.flashes.length; i++) {
       if (this.flashAge[i] < 0) continue;
       this.flashAge[i] += delta;
@@ -675,6 +896,7 @@ export class BoardView {
   setLesson(text: string | null): void {
     this.lesson.mesh.visible = text !== null;
     this.hud.mesh.visible = text === null;
+    this.scoreGroup.visible = text === null;
     if (text !== null) this.lesson.set(text);
   }
 

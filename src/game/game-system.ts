@@ -22,7 +22,6 @@ import {
   other,
   outcome,
   QUICK,
-  seedsOf,
   sow,
   takeBonus,
   type Move,
@@ -510,6 +509,8 @@ export class GameSystem extends createSystem({
   private syncSeeds(): void {
     const n = loopSize(this.options);
     let id = 0;
+    this.resetMove();
+    this.outlookState = null;
     this.hand = [];
     this.flights = [];
     this.landings = [];
@@ -635,6 +636,17 @@ export class GameSystem extends createSystem({
       this.moveSeed(id, this.carrySlot(player, pit, k), 0.18, 0.004),
     );
     this.sounds.lift(ids.length);
+    // The last seed landed on others and the move carries on: say so.
+    this.chain += 1;
+    if (this.chain >= 2) {
+      this.view.popup(
+        player,
+        pit,
+        `Chain ×${this.chain}`,
+        player === HUMAN ? '#ffd23a' : '#ff8a5c',
+        this.chain >= 4,
+      );
+    }
   }
 
   private dropInto(player: Player, pit: number): void {
@@ -647,7 +659,8 @@ export class GameSystem extends createSystem({
     this.hand.forEach((h, k) =>
       this.moveSeed(h, this.carrySlot(player, pit, k), 0.12, 0),
     );
-    this.sounds.clack(list.length);
+    this.sounds.clack(list.length, this.dropStep, player === AI);
+    this.dropStep += 1;
   }
 
   /**
@@ -673,7 +686,17 @@ export class GameSystem extends createSystem({
       });
     });
     this.view.flash(victim, pit, by === HUMAN ? GOLD : RED);
-    this.sounds.capture();
+    if (ids.length === 0) return;
+    this.taken += ids.length;
+    this.view.popup(
+      victim,
+      pit,
+      by === HUMAN ? `+${ids.length}` : `−${ids.length}`,
+      by === HUMAN ? '#ffd23a' : '#ff6a3d',
+      ids.length >= 4,
+    );
+    this.sounds.capture(this.taken);
+    if (this.taken >= 5) this.view.burst(by === HUMAN ? GOLD : RED);
   }
 
   /** Send off captured seeds whose moment has come, and sound each landing. */
@@ -801,6 +824,7 @@ export class GameSystem extends createSystem({
 
   private nextTurn(): void {
     this.ghost?.hide();
+    this.resetMove();
     if (this.lesson >= 0) {
       this.lessonRead();
       return;
@@ -845,6 +869,68 @@ export class GameSystem extends createSystem({
   }
 
   private aiMove: Move | null = null;
+  /** This move so far: lifts, seeds dropped, seeds captured. */
+  private chain = 0;
+  private dropStep = 0;
+  private taken = 0;
+  private outlookState: State | null = null;
+  private gains: number[] = [];
+  private threats: boolean[] = [];
+
+  private resetMove(): void {
+    this.chain = 0;
+    this.dropStep = 0;
+    this.taken = 0;
+  }
+
+  /**
+   * On the human's turn: what each of their pits would capture ("+n"), and
+   * which of their pits the opponent could capture if it were to move now.
+   */
+  private updateOutlook(): void {
+    const want =
+      this.phase === 'human' && !this.placement.busy ? this.state : null;
+    if (want === this.outlookState) return;
+    this.outlookState = want;
+    if (!want) {
+      this.view.showGains(null);
+      this.view.showThreats(null);
+      return;
+    }
+    const n = loopSize(this.options);
+    this.gains.length = n;
+    this.threats.length = n;
+    this.gains.fill(0);
+    this.threats.fill(false);
+    for (const pit of legalPits(want)) {
+      for (const event of sow(want, pit).events) {
+        if (event.type === 'capture') this.gains[pit] += event.seeds;
+      }
+    }
+    this.view.showGains(this.gains);
+    if (this.lesson >= 0) {
+      this.view.showThreats(null);
+      return;
+    }
+    const theirs: State = { ...want, toMove: AI, phase: 'sow', bonusLeft: 0 };
+    for (const pit of legalPits(theirs)) {
+      for (const event of sow(theirs, pit).events) {
+        if (event.type !== 'capture') continue;
+        for (const hit of event.pits) if (want.pits[HUMAN][hit] > 0) this.threats[hit] = true;
+      }
+    }
+    this.view.showThreats(this.threats);
+  }
+
+  private updateScore(): void {
+    let mine = this.mover === HUMAN ? this.hand.length : 0;
+    let theirs = this.mover === AI ? this.hand.length : 0;
+    const a = this.pitSeeds[HUMAN];
+    const b = this.pitSeeds[AI];
+    for (let i = 0; i < a.length; i++) mine += a[i].length;
+    for (let i = 0; i < b.length; i++) theirs += b[i].length;
+    this.view.setScore(mine, theirs);
+  }
 
   private onAiMove(id: number, move: Move | null): void {
     if (id !== this.requestId || this.phase !== 'thinking') return;
@@ -926,6 +1012,7 @@ export class GameSystem extends createSystem({
 
   /** Put the lifted seeds back: the player changed their mind. */
   private cancelHold(): void {
+    this.resetMove();
     const pit = this.heldPit;
     this.heldPit = -1;
     this.heldSide = null;
@@ -1347,6 +1434,8 @@ export class GameSystem extends createSystem({
     }
 
     this.updateHover();
+    this.updateOutlook();
+    this.updateScore();
     this.updateHud();
   }
 
@@ -1503,10 +1592,7 @@ export class GameSystem extends createSystem({
         }
       }
     }
-    const line2 = `Seeds: you ${seedsOf(this.state, HUMAN)} · Moruba ${seedsOf(
-      this.state,
-      AI,
-    )}     Captured: you ${this.state.captured[HUMAN]} · Moruba ${this.state.captured[AI]}`;
+    const line2 = `Captured: you ${this.state.captured[HUMAN]} · Moruba ${this.state.captured[AI]}`;
     const text = `${line1}\n${line2}\n${this.teach || this.teachEnds ? this.tip : ''}`;
     if (text !== this.hudText) {
       this.hudText = text;
