@@ -27,10 +27,10 @@ export const OPPONENTS: readonly Opponent[] = [
     gloat: ['Ha! Did you see that?', 'I got some!', 'That worked?'],
     rue: ['Hey, those were mine!', 'I did not see that coming.', 'Ouch.'],
     won: 'I won! Wait until I tell my sister.',
-    lost: 'Good game. Lerato will not be so easy.',
+    lost: 'Good game. Mpho will not be so easy.',
   },
   {
-    name: 'Lerato',
+    name: 'Mpho',
     level: 'medium',
     intro: 'Thabo says you are good. Let us see.',
     gloat: ['Watch your inner row.', 'You left that open.', 'Thank you for those.'],
