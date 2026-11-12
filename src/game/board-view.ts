@@ -140,6 +140,7 @@ export class BoardView {
   readonly handleZ: number;
   private texts: TextPlane[] = [];
   private disposables: { dispose(): void }[] = [];
+  private dots: Mesh[] = [];
 
   constructor(readonly options: Options) {
     this.root.name = 'moruba-board';
@@ -377,6 +378,25 @@ export class BoardView {
     this.highlight.name = 'pit-highlight';
     this.highlight.visible = false;
     this.root.add(this.highlight);
+
+    // A bright dot at each hand's pinch point: "this is where you pick".
+    const dotGeometry = new SphereGeometry(0.006, 12, 8);
+    this.disposables.push(dotGeometry);
+    for (let i = 0; i < 2; i++) {
+      const dotMaterial = new MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+      });
+      this.disposables.push(dotMaterial);
+      const dot = new Mesh(dotGeometry, dotMaterial);
+      dot.name = `pinch-dot-${i}`;
+      dot.renderOrder = 20;
+      dot.visible = false;
+      this.root.add(dot);
+      this.dots.push(dot);
+    }
     this.disposables.push(ringGeometry, ringMaterial);
     for (let i = 0; i < 4; i++) {
       const material = ringMaterial.clone();
@@ -557,6 +577,16 @@ export class BoardView {
 
   commitSeeds(): void {
     this.seeds.instanceMatrix.needsUpdate = true;
+  }
+
+  /** Show (board-space position) or hide the dot for hand `i`; gold when over something. */
+  setDot(i: number, at: Vector3 | null, over = false): void {
+    const dot = this.dots[i];
+    dot.visible = at !== null;
+    if (!at) return;
+    dot.position.copy(at);
+    dot.scale.setScalar(over ? 1.5 : 1);
+    (dot.material as MeshBasicMaterial).color.setHex(over ? 0xffd27a : 0xffffff);
   }
 
   showHighlight(player: Player, pit: number, colour: number): void {

@@ -44,6 +44,7 @@ import {
   storeSlot,
   TOP_Y,
   type Vec3,
+  boardSize,
 } from './layout.js';
 import { HudButton, Pit } from './pit-component.js';
 import { PlacementSystem } from './placement.js';
@@ -186,6 +187,8 @@ export class GameSystem extends createSystem({
   // Direct hand play (headset, hands): the pit or button at the pinch point.
   // Codes: -1 nothing, player * 100 + pit, or 1000 + button number.
   private pinch = new Vector3();
+  private reachX = 0.5;
+  private reachZ = 0.5;
   private local = new Vector3();
   private nearHistory = {
     left: new Int16Array(8).fill(-1),
@@ -282,6 +285,9 @@ export class GameSystem extends createSystem({
       this.view.dispose();
     }
     this.view = new BoardView(this.options);
+    const size = boardSize(this.options);
+    this.reachX = size.width / 2 + 0.1;
+    this.reachZ = size.depth / 2 + 0.2;
     this.viewEntity = this.world.createTransformEntity(
       this.view.root,
       this.placement.rootEntity,
@@ -983,9 +989,21 @@ export class GameSystem extends createSystem({
     const xr = this.input.xr;
     this.directHover = -1;
     this.nearFrame = (this.nearFrame + 1) % 8;
-    for (const side of SIDES) {
+    for (let s = 0; s < SIDES.length; s++) {
+      const side = SIDES[s];
       const tracked = pinchPoint(this, side, this.pinch);
       const now = tracked ? this.targetAt(this.pinch) : -1;
+      // Show where this hand would pick, while it is near the board.
+      let near = false;
+      if (tracked && !this.manual && !this.dragSide) {
+        this.view.root.worldToLocal(this.local.copy(this.pinch));
+        near =
+          Math.abs(this.local.x) < this.reachX &&
+          Math.abs(this.local.z) < this.reachZ &&
+          this.local.y > -0.08 &&
+          this.local.y < 0.22;
+      }
+      this.view.setDot(s, near ? this.local : null, now >= 0);
       const history = this.nearHistory[side];
       // Closing the fingers drags the pinch point: trust where it was a few
       // frames earlier.
@@ -1292,10 +1310,18 @@ export class GameSystem extends createSystem({
       this.startAiMove(move);
     }
 
+    // With hands the game is played by pinching things directly, so the
+    // pointing ray would only mislead: switch it off for hands, on otherwise.
+    for (const side of SIDES) {
+      const hand = this.placement.inXR && this.input.xr.isPrimary('hand', side);
+      this.input.xr.multiPointers[side].toggleSubPointer('ray', !hand);
+    }
     if (this.direct) {
       this.updateDirect(delta);
     } else {
       this.directHover = -1;
+      this.view.setDot(0, null);
+      this.view.setDot(1, null);
       // The handle is for hands only.
       this.view.setHandle('hidden');
       if (this.dragSide) {
