@@ -118,6 +118,10 @@ export class BoardView {
   readonly root = new Group();
   readonly pitTargets: PitTarget[] = [];
   readonly buttons: ButtonView[] = [];
+  private menuOpen = true;
+  private menuBase = 0;
+  private menuHome = new Vector3();
+  private menuLayout = { rows: 2, pitch: 0.034, hudHeight: 0.092, barHeight: 0.016 };
   /** Tilted frame holding the status panel and the buttons. */
   readonly hudGroup = new Group();
   readonly seedCount: number;
@@ -463,8 +467,9 @@ export class BoardView {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#ffd23a';
-      ctx.font = `bold ${Math.round(h * 0.2)}px ${FONT}`;
-      ctx.fillText(line1, w / 2, h * (tip ? 0.2 : 0.32), w * 0.94);
+      const alone = !line2 && !tip;
+      ctx.font = `bold ${Math.round(h * (alone ? 0.3 : 0.22))}px ${FONT}`;
+      ctx.fillText(line1, w / 2, h * (alone ? 0.52 : tip ? 0.2 : 0.32), w * 0.94);
       ctx.fillStyle = '#f3ead9';
       ctx.font = `${Math.round(h * 0.15)}px ${FONT}`;
       ctx.fillText(line2, w / 2, h * (tip ? 0.45 : 0.68), w * 0.94);
@@ -489,7 +494,7 @@ export class BoardView {
     this.hudGroup.rotation.x = -0.5;
     this.root.add(this.hudGroup);
 
-    const actions = ['new', 'level', 'daily', 'teach', 'size', 'room', 'move'];
+    const actions = ['new', 'level', 'daily', 'teach', 'size', 'room', 'move', 'menu'];
     const perRow = 4;
     const gap = 0.006;
     const buttonHeight = 0.028;
@@ -519,11 +524,9 @@ export class BoardView {
       });
     });
     this.hud.mesh.name = 'hud-panel';
-    this.hud.mesh.position.set(
-      0,
-      rows * (buttonHeight + gap) + hudHeight / 2,
-      0,
-    );
+    this.menuLayout = { rows, pitch: buttonHeight + gap, hudHeight, barHeight: 0.016 };
+    const menu = this.buttons[this.buttons.length - 1].mesh;
+    this.menuHome.copy(menu.position);
     this.hudGroup.add(this.hud.mesh);
     this.texts.push(this.hud);
 
@@ -553,24 +556,23 @@ export class BoardView {
     this.scoreText.mesh.position.z = 0.0006;
     this.texts.push(this.scoreText);
     this.scoreGroup.name = 'score-bar';
-    this.scoreGroup.position.set(
-      0,
-      rows * (buttonHeight + gap) + hudHeight + 0.005 + barHeight / 2,
-      0,
-    );
     this.scoreGroup.add(this.scoreMine, this.scoreTheirs, this.scoreText.mesh);
     this.hudGroup.add(this.scoreGroup);
     this.layoutScore();
 
-    // "+5" badges over the human's pits that would capture.
+    // Badges over the human's playable pits: what the move takes ("+5", gold)
+    // and a red "!" when it is clearly riskier than the safest move.
     for (let i = 0; i < n; i++) {
-      const badge = new TextPlane(0.034, 0.02, 3200, (ctx, w, h, text) => {
+      const badge = new TextPlane(0.04, 0.02, 3200, (ctx, w, h, text) => {
         panel(ctx, w, h, 'rgba(24, 16, 10, 0.92)');
-        ctx.fillStyle = '#ffd23a';
-        ctx.font = `bold ${Math.round(h * 0.74)}px ${FONT}`;
+        const parts = text.split(' ');
+        ctx.font = `bold ${Math.round(h * (parts.length > 1 ? 0.6 : 0.74))}px ${FONT}`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(text, w / 2, h * 0.55, w * 0.9);
+        parts.forEach((part, k) => {
+          ctx.fillStyle = part[0] === '+' ? '#ffd23a' : '#ff7a55';
+          ctx.fillText(part, (w * (k + 0.5)) / parts.length, h * 0.55, (w * 0.9) / parts.length);
+        });
       });
       const [x, , z] = pitCentre(options, 0, i);
       badge.mesh.name = `pit-gain-${i}`;
@@ -698,6 +700,9 @@ export class BoardView {
     this.lesson.mesh.visible = false;
     this.lesson.mesh.position.set(0, rows * (buttonHeight + gap) + lessonHeight / 2, 0);
     this.hudGroup.add(this.lesson.mesh);
+    this.menuOpen = true;
+    this.menuBase = rows * (buttonHeight + gap);
+    this.setMenu(false);
     this.texts.push(this.lesson);
   }
 
@@ -759,13 +764,36 @@ export class BoardView {
     this.scoreGroup.visible = visible;
   }
 
-  /** "+n" over each of the human's pits that would capture n seeds (0 = nothing). */
-  showGains(gains: readonly number[] | null): void {
+  /** A short label over each of the human's pits ('' = none): "+4", "!" or "+4 !". */
+  showGains(labels: readonly string[] | null): void {
     for (let i = 0; i < this.gains.length; i++) {
-      const gain = gains ? (gains[i] ?? 0) : 0;
-      this.gains[i].mesh.visible = gain > 0;
-      if (gain > 0) this.gains[i].set(`+${gain}`);
+      const label = labels ? (labels[i] ?? '') : '';
+      this.gains[i].mesh.visible = label !== '';
+      if (label) this.gains[i].set(label);
     }
+  }
+
+  /**
+   * The buttons fold away behind one "Menu" button so nothing competes with
+   * the board during play; the panel drops down to sit just above it.
+   */
+  setMenu(open: boolean): void {
+    if (open === this.menuOpen) return;
+    this.menuOpen = open;
+    const { rows, pitch, hudHeight, barHeight } = this.menuLayout;
+    const last = this.buttons.length - 1;
+    this.buttons.forEach((button, i) => {
+      if (i !== last) button.mesh.visible = open;
+    });
+    const menu = this.buttons[last];
+    menu.setLabel(open ? 'Close menu' : 'Menu');
+    if (open) menu.mesh.position.copy(this.menuHome);
+    else menu.mesh.position.set(0, this.menuHome.y, 0);
+    const base = (open ? rows : 1) * pitch;
+    this.hud.mesh.position.set(0, base + hudHeight / 2, 0);
+    this.lesson.mesh.position.y += base - this.menuBase;
+    this.menuBase = base;
+    this.scoreGroup.position.set(0, base + hudHeight + 0.005 + barHeight / 2, 0);
   }
 
   /** Warn on the human's pits the opponent could capture next turn. */

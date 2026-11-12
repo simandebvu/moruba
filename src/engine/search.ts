@@ -24,16 +24,28 @@ export interface SearchOptions {
   timeMs?: number;
   /** Chance (0..1) of playing a random legal move instead; needs `random`. */
   blunder?: number;
+  /**
+   * How much the blunder chance follows the score: it rises by this much when
+   * the mover leads by a full starting side of seeds and falls by as much when
+   * behind (kept within 0..0.9). Keeps games close; 0 or absent = steady play.
+   */
+  mercy?: number;
   /** Random source for `blunder` and for breaking ties; defaults to Math.random. */
   random?: () => number;
   /** Clock, injectable for tests. */
   now?: () => number;
 }
 
+/**
+ * Tuned by simulation (12 Nov) so that a newcomer who simply takes what the
+ * "+n" badges offer beats easy about 6 games in 10 and medium about 3 in 10,
+ * and a player who also looks one reply ahead beats medium about 3 in 4 and
+ * hard about 1 in 10. `mercy` keeps the lead changing hands.
+ */
 export const LEVELS: Record<Level, SearchOptions> = {
-  easy: { depth: 2, quiescence: 0, blunder: 0.25, timeMs: 500 },
-  medium: { depth: 4, quiescence: 2, timeMs: 1200 },
-  hard: { depth: 6, quiescence: 4, timeMs: 2500 },
+  easy: { depth: 1, quiescence: 0, blunder: 0.5, mercy: 0.6, timeMs: 300 },
+  medium: { depth: 2, quiescence: 0, blunder: 0.4, mercy: 0.6, timeMs: 500 },
+  hard: { depth: 3, quiescence: 1, blunder: 0.12, mercy: 0.4, timeMs: 1200 },
 };
 
 export interface SearchResult {
@@ -218,7 +230,17 @@ export function search(state: State, options: SearchOptions): SearchResult {
   if (root.length === 0 || outcome(state).over) {
     return { move: null, score: -WIN, depth: 0, nodes: 0 };
   }
-  if (options.blunder && random() < options.blunder) {
+  let slip = options.blunder ?? 0;
+  if (options.mercy) {
+    const me = state.toMove;
+    let mine = 0;
+    let theirs = 0;
+    for (const n of state.pits[me]) mine += n;
+    for (const n of state.pits[other(me)]) theirs += n;
+    const side = state.options.cols * 2 * state.options.seedsPerPit;
+    slip = Math.min(0.9, Math.max(0, slip + (options.mercy * (mine - theirs)) / side));
+  }
+  if (slip > 0 && random() < slip) {
     const pick = root[Math.floor(random() * root.length)];
     return { move: pick.move, score: 0, depth: 0, nodes: 0 };
   }

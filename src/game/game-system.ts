@@ -286,8 +286,10 @@ export class GameSystem extends createSystem({
     this.world.createTransformEntity(this.room.group, this.placement.rootEntity);
     this.buildBoard();
     // First visit: learn the game before playing it.
-    if (readFlag(LESSON_KEY) === '1') this.startGame();
-    else this.startLesson();
+    // After that, a visit opens on today's move of the day until it is solved.
+    if (readFlag(LESSON_KEY) !== '1') this.startLesson();
+    else if ((readFlag(DAILY_KEY) ?? '').split('|')[0] !== dateKey(new Date())) this.startDaily();
+    else this.startGame();
     // Read-only handle for automated checks and debugging.
     (globalThis as { __moruba?: unknown }).__moruba = {
       state: () => this.state,
@@ -386,6 +388,8 @@ export class GameSystem extends createSystem({
         case 'move':
           button.setLabel('Bring board');
           break;
+        case 'menu':
+          break; // labelled by the view
       }
     }
   }
@@ -601,7 +605,7 @@ export class GameSystem extends createSystem({
     const request: AiRequest = {
       id: this.hintId,
       state: this.state,
-      level: 'medium',
+      level: 'hard',
       purpose: 'hint',
     };
     if (this.worker) {
@@ -821,7 +825,7 @@ export class GameSystem extends createSystem({
       // One steady stream, even when two pits are taken at once.
       const last = this.flights[this.flights.length - 1];
       this.flights.push({
-        at: Math.max(this.clock + 0.2, last ? last.at + 0.07 : 0),
+        at: Math.max(this.clock + 0.16, last ? last.at + 0.05 : 0),
         id,
         target: storeSlot(this.options, by, slot),
       });
@@ -844,8 +848,8 @@ export class GameSystem extends createSystem({
   private updateFlights(): void {
     while (this.flights.length > 0 && this.flights[0].at <= this.clock) {
       const flight = this.flights.shift()!;
-      this.moveSeed(flight.id, flight.target, 0.6, 0.13);
-      this.landings.push(this.clock + 0.58);
+      this.moveSeed(flight.id, flight.target, 0.45, 0.13);
+      this.landings.push(this.clock + 0.43);
     }
     while (this.landings.length > 0 && this.landings[0] <= this.clock) {
       this.landings.shift();
@@ -870,7 +874,8 @@ export class GameSystem extends createSystem({
         case 'drop': {
           drops += 1;
           // Long relays speed up so nobody waits through fifty hops.
-          const gap = drops < 10 ? 0.17 : drops < 28 ? 0.12 : 0.08;
+          // The opponent's turn is watched, not played: keep it brisk.
+          const gap = (drops < 10 ? 0.14 : drops < 28 ? 0.1 : 0.07) * (player === AI ? 0.75 : 1);
           this.queue(gap, () => this.dropInto(player, event.pit));
           break;
         }
@@ -879,7 +884,7 @@ export class GameSystem extends createSystem({
             this.scriptHighlight = { player, pit: event.at, colour: RED };
             for (const pit of event.pits) this.capturePit(player, pit);
           });
-          this.queue(0.7, () => {
+          this.queue(0.45, () => {
             this.scriptHighlight = null;
           });
           break;
@@ -1030,6 +1035,12 @@ export class GameSystem extends createSystem({
   }
 
   private aiMove: Move | null = null;
+  /** The buttons are folded behind "Menu" during play and come out when a game ends. */
+  private menuOpen = false;
+  private menuForced = false;
+  private menuShown = false;
+  private risks: number[] = [];
+  private labels: string[] = [];
   private wasResting = false;
   /** This move so far: lifts, seeds dropped, seeds captured. */
   private chain = 0;
@@ -1064,29 +1075,63 @@ export class GameSystem extends createSystem({
     this.threats.length = n;
     this.gains.fill(0);
     this.threats.fill(false);
+    this.risks.length = n;
+    this.labels.length = n;
+    this.risks.fill(0);
+    this.labels.fill('');
+    const teaching = this.lesson >= 0;
+    // In the lesson only the pit being taught may shout.
+    const taught = teaching ? LESSON[Math.min(this.lesson, LESSON.length - 1)].pit : -1;
     for (const pit of legalPits(want)) {
-      for (const event of sow(want, pit).events) {
+      if (teaching && pit !== taught) continue;
+      const result = sow(want, pit);
+      for (const event of result.events) {
         if (event.type === 'capture') this.gains[pit] += event.seeds;
       }
+      this.risks[pit] = teaching ? 0 : this.worstReply(result.state);
     }
-    if (this.lesson >= 0) {
-      // In the lesson only the pit being taught may shout.
-      const taught = LESSON[Math.min(this.lesson, LESSON.length - 1)].pit;
-      for (let i = 0; i < n; i++) if (i !== taught) this.gains[i] = 0;
+    // Only a move clearly more dangerous than the safest one gets a warning,
+    // so the board is not covered in numbers.
+    let safest = Infinity;
+    for (const pit of legalPits(want)) safest = Math.min(safest, this.risks[pit]);
+    for (const pit of legalPits(want)) {
+      const gain = this.gains[pit] > 0 ? `+${this.gains[pit]}` : '';
+      const risky = this.risks[pit] >= safest + 3;
+      this.labels[pit] = gain && risky ? `${gain} !` : gain || (risky ? '!' : '');
     }
-    this.view.showGains(this.gains);
-    if (this.lesson >= 0) {
-      this.view.showThreats(null);
-      return;
+    this.view.showGains(this.labels);
+    this.view.showThreats(null);
+  }
+
+  /**
+   * The most seeds the opponent could take straight after this position
+   * (their capture plus the fullest pit left as their extra pick). If the
+   * human still has an extra pit to pick, the fullest is assumed.
+   */
+  private worstReply(after: State): number {
+    let state = after;
+    while (state.phase === 'bonus' && state.toMove === HUMAN) {
+      const options = bonusOptions(state);
+      if (options.length === 0) return 0;
+      let pick = options[0];
+      for (const pit of options) if (state.pits[AI][pit] > state.pits[AI][pick]) pick = pit;
+      state = takeBonus(state, pick);
     }
-    const theirs: State = { ...want, toMove: AI, phase: 'sow', bonusLeft: 0 };
-    for (const pit of legalPits(theirs)) {
-      for (const event of sow(theirs, pit).events) {
-        if (event.type !== 'capture') continue;
-        for (const hit of event.pits) if (want.pits[HUMAN][hit] > 0) this.threats[hit] = true;
+    if (state.toMove !== AI || state.phase !== 'sow') return 0;
+    let worst = 0;
+    for (const pit of legalPits(state)) {
+      const reply = sow(state, pit);
+      if (!reply.captured) continue;
+      let lost = 0;
+      for (const event of reply.events) if (event.type === 'capture') lost += event.seeds;
+      if (reply.state.phase === 'bonus') {
+        let fullest = 0;
+        for (const seeds of reply.state.pits[HUMAN]) if (seeds > fullest) fullest = seeds;
+        lost += fullest;
       }
+      if (lost > worst) worst = lost;
     }
-    this.view.showThreats(this.threats);
+    return worst;
   }
 
   private updateScore(): void {
@@ -1116,7 +1161,7 @@ export class GameSystem extends createSystem({
       this.scriptHighlight = { player: AI, pit: move.pit, colour: GOLD };
       this.ghostOver(AI, move.pit);
     });
-    this.queue(0.6, () => {
+    this.queue(0.4, () => {
       this.scriptHighlight = null;
     });
     this.beginSow(AI, move.pit, false);
@@ -1203,6 +1248,7 @@ export class GameSystem extends createSystem({
     const buttons = this.view.buttons;
     for (let i = 0; i < buttons.length; i++) {
       const mesh = buttons[i].mesh;
+      if (!mesh.visible) continue;
       mesh.worldToLocal(this.local.copy(point));
       const size = (mesh.geometry as PlaneGeometry).parameters;
       if (
@@ -1480,10 +1526,11 @@ export class GameSystem extends createSystem({
     }
     marks.unshift({ player: HUMAN, pit: end, colour: WHITE });
     this.view.showMarks(marks);
+    const risk = this.lesson < 0 && !this.daily ? (this.risks[pit] ?? 0) : 0;
+    const back = risk > 0 ? ` · they could take ${risk}` : ' · safe';
     this.previewText =
-      seeds > 0
-        ? `This move captures ${seeds} seeds, plus a pit you choose`
-        : 'This move ends in the white ring: no capture';
+      (seeds > 0 ? `Takes ${seeds} + a pit you choose` : 'No capture') +
+      (this.lesson < 0 && !this.daily ? back : '');
   }
 
   private onButton(action: string): void {
@@ -1492,6 +1539,14 @@ export class GameSystem extends createSystem({
     if (this.placement.busy || this.phase === 'animating') return;
     // A button press is not "pinch anywhere to continue".
     this.readSince = this.clock;
+    if (action === 'menu') {
+      this.menuOpen = !this.menuShown;
+      this.menuForced = false;
+      this.sounds.step();
+      return;
+    }
+    if (!this.menuShown) return; // folded away: not there to be pressed
+    this.menuOpen = false;
     if ((this.lesson >= 0 || this.daily) && (action === 'size' || action === 'level')) {
       this.sounds.deny();
       return;
@@ -1575,7 +1630,7 @@ export class GameSystem extends createSystem({
     if (
       this.phase === 'thinking' &&
       this.aiMove &&
-      this.clock - this.thinkStarted > 0.7
+      this.clock - this.thinkStarted > 0.35
     ) {
       const move = this.aiMove;
       this.aiMove = null;
@@ -1623,6 +1678,13 @@ export class GameSystem extends createSystem({
       this.reportedPhase = this.phase;
       report('phase', { phase: this.phase, lesson: this.lesson });
     }
+
+    // The menu opens by itself when a game ends (once; it can still be closed).
+    const ended = this.phase === 'over';
+    if (ended && !this.menuForced) this.menuOpen = true;
+    this.menuForced = ended;
+    this.menuShown = this.menuOpen;
+    this.view.setMenu(this.menuShown);
 
     this.updateHover();
     this.updateOutlook();
@@ -1752,25 +1814,22 @@ export class GameSystem extends createSystem({
     } else {
       switch (this.phase) {
         case 'human':
-          line1 = this.previewText || 'Your turn: pinch one of your pits';
+          line1 = this.previewText || 'Your turn';
           break;
         case 'held':
-          line1 = this.direct ? 'Sweep your hand over the gold ring · or pinch this pit again to play it' : 'Let go to sow';
+          line1 = this.direct ? 'Sweep over the gold ring' : 'Let go to sow';
           break;
         case 'sowing':
-          line1 = 'A seed drops in each gold ring · pinch and the rest sow themselves';
+          line1 = 'Keep sweeping · or pinch to finish';
           break;
         case 'animating':
-          line1 =
-            this.mover === HUMAN
-              ? 'Sowing… hold a pinch to speed up'
-              : `${this.rivalName} sows… hold a pinch to speed up`;
+          line1 = this.mover === HUMAN ? 'Sowing…' : `${this.rivalName} sows…`;
           break;
         case 'bonus':
-          line1 = 'Capture! Pinch any one of their pits to take it too';
+          line1 = 'Capture! Take one more of their pits';
           break;
         case 'thinking':
-          line1 = `${this.rivalName} is thinking…`;
+          line1 = `${this.rivalName}…`;
           break;
         case 'reading':
           line1 = '';
@@ -1780,20 +1839,25 @@ export class GameSystem extends createSystem({
           line1 = !o.over
             ? ''
             : o.winner === null
-              ? 'A draw. Pinch New game'
+              ? 'A draw'
               : o.winner === HUMAN
                 ? this.advance
-                  ? `You beat ${this.rivalName}! Pinch New game to face ${OPPONENTS[this.rival + 1].name}`
-                  : `You beat ${this.rivalName}! Pinch New game`
-                : `${this.rivalName} wins. Pinch New game`;
+                  ? `You beat ${this.rivalName}! Next: ${OPPONENTS[this.rival + 1].name}`
+                  : `You beat ${this.rivalName}!`
+                : `${this.rivalName} wins`;
           break;
         }
       }
     }
-    const line2 = `Captured: you ${this.state.captured[HUMAN]} · ${this.rivalName} ${this.state.captured[AI]}${
-      this.streak > 1 ? `   ·   ${this.streak} wins in a row` : ''
-    }`;
-    const text = `${line1}\n${line2}\n${this.teach || this.teachEnds ? this.tip : this.remark}`;
+    // The bar above already shows the score; the panel says one thing at a time.
+    const teaching = this.teach || this.teachEnds;
+    const line2 =
+      this.phase === 'over'
+        ? `Pinch New game${this.streak > 1 ? `   ·   ${this.streak} wins in a row` : ''}`
+        : teaching || this.placement.placing
+          ? ''
+          : this.remark;
+    const text = `${line1}\n${line2}\n${teaching ? this.tip : ''}`;
     if (text !== this.hudText) {
       this.hudText = text;
       this.view.setHud(text);
