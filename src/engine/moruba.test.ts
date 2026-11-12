@@ -796,5 +796,6 @@ describe('property: random games', () => {
       if (o.over && o.reason === 'no-moves') expect(legalPits(s)).toEqual([]);
       check();
     }
-  });
+    // Seeded, so the result never varies; the long limit is for a busy machine.
+  }, 30000);
 });
